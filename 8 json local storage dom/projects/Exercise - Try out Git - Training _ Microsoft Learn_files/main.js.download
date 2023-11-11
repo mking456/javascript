@@ -1,0 +1,4245 @@
+"use strict";
+
+var queryMap = (function () {
+  var query = window.location.search.substring(1);
+  var parameterList = query.split("&");
+  var map = {};
+  for (var i = 0; i < parameterList.length; i++) {
+    var pair = parameterList[i].split("=");
+    map[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1]);
+  }
+  return map;
+})();
+
+function format(fmtstr) {
+  var args = Array.prototype.slice.call(arguments, 1);
+  return fmtstr.replace(/\{(\d+)\}/g, function (match, index) {
+    return args[index];
+  });
+}
+
+// by the time the jwk reaches here it is no longer parseable into json. this may be better fixed on the agent side
+// but in the meantime, fixing it here by manually parsing the string into an object then turning it into a string
+function reformatJwk(jwk) {
+  var jwkArray = jwk.replaceAll(/[ "'{}]/ig, '').split(',');
+  var jwkObj = {};
+  jwkArray.forEach(entry => {
+    var pair = entry.split(":");
+    jwkObj[pair[0]] = pair[1];
+  });
+  return JSON.stringify(jwkObj);
+}
+
+// Wrap local storage reads and writes in try-catch in case browser security refuses access and throws error
+function getFromLocalStorage(setting) {
+  try {
+    return window.localStorage.getItem(setting);
+  }
+  catch (e) {
+    return null;
+  }
+}
+
+function addToLocalStorage(setting, value) {
+  try {
+    window.localStorage.setItem(setting, value);
+  }
+  catch (e) { }
+}
+
+function isEmptyOrSpaces(str) {
+  return str === null || str.match(/^ *$/) !== null;
+}
+
+function getQueryParameter(name) {
+  return queryMap[name] || "";
+}
+
+function getQueryParametersPrefix(prefix) {
+  return Object.keys(queryMap).filter(function (queryKey) {
+    return queryKey.indexOf(prefix) === 0;
+  }).map(function (queryKey) {
+    return { name: queryKey, value: queryMap[queryKey] }
+  })
+}
+
+var term,
+  editor,
+  consoleUri,
+  termId,
+  userRootDirectory,
+  codeEditorDirectory,
+  accessToken,
+  tenantId,
+  puid,
+  getTokenInterval,
+  userSettings,
+  storageType,
+  showAdvancedSettings,
+  embed = getQueryParameter('embed') === 'true',
+  popout = getQueryParameter('popout') === 'true',
+  fullscreenDisplay = getQueryParameter('fullscreen') === 'true',
+  ephemeralSession = getQueryParameter("feature.azureconsole.sessiontype") === 'ephemeral',
+  userSubscription = getQueryParameter("feature.azureconsole.usersubscription"),
+  language = getQueryParameter('l').split('.')[0],
+  cloudshellVersion = getQueryParameter('version');
+
+if (embed) {
+  document.documentElement.classList.add('embed');
+}
+
+var trustedParentOrigin = getQueryParameter("trustedAuthority");
+var trustedAuthority;
+var cloudShellStorageString = "cloud-shell-storage";
+var activeSession = false;
+var appInsights;
+
+var injectedCommands = "";
+
+var fontSizes = {
+  "small": 13,
+  "medium": 16,
+  "large": 21
+};
+var fontStyles = {
+  "monospace": "monospace",
+  "courier": "Courier New, courier, monospace"
+}
+var backgroundColors = {
+  "bash": "#000000",
+  "pwsh": "#012456",
+  "drag": "#4c4c4c",
+}
+
+// Maps storage locations to valid locations for use in userSettings.
+var storageLocationMapping = {
+  "southeastasia": "southeastasia",
+  "australiasoutheast": "southeastasia",
+  "koreacentral": "southeastasia",
+  "australiaeast": "southeastasia",
+  "australiacentral": "southeastasia",
+  "japanwest": "southeastasia",
+  "japaneast": "southeastasia",
+  "eastasia": "southeastasia",
+  "eastus": "eastus",
+  "eastus2": "eastus",
+  "canadaeast": "eastus",
+  "brazilsouth": "eastus",
+  "westus": "westus",
+  "westus2": "westus",
+  "canadacentral": "westus",
+  "southcentralus": "southcentralus",
+  "northcentralus": "southcentralus",
+  "centralus": "southcentralus",
+  "westcentralus": "southcentralus",
+  "northeurope": "northeurope",
+  "germanywestcentral": "northeurope",
+  "switzerlandnorth": "northeurope",
+  "norwayeast": "northeurope",
+  "jioindiawest": "centralindia",
+  "westeurope": "westeurope",
+  "uksouth": "westeurope",
+  "ukwest": "westeurope",
+  "francecentral": "westeurope",
+  "centralindia": "centralindia",
+  "southindia": "centralindia",
+  "westindia": "centralindia",
+  "southafricanorth": "centralindia",
+  "uaenorth": "centralindia"
+};
+
+var storageLocationMappingGov = {
+  "usgovvirginia": "usgovvirginia",
+  "usgovarizona": "usgovarizona"
+};
+
+var storageLocationMappingNat = {
+  "usnatwest": "usnatwest",
+  "usnateast": "usnateast"
+};
+
+var storageLocationMappingSec = {
+  "ussecwest": "ussecwest",
+  "usseceast": "usseceast"
+};
+
+// These audiences have to match Extensions.xxx.json
+// https://msazure.visualstudio.com/One/Azure%20Portal/_git/AzureUX-PortalFx?path=%2Fsrc%2FRDPackages%2FOneCloud%2FExtensions.prod.json&line=154&lineEnd=198&lineStartColumn=12&lineEndColumn=14
+// All audiences should be added to validAudienceList on L386 as well.
+var tokenAudiences = {
+  // Universal
+  "https://graph.windows.net/": "graph",
+  "https://storage.azure.com/": "storage",
+  "https://www.yammer.com": "yammer",
+  "https://azure-devices-provisioning.net": "devicesprovisioning",
+  "6dae42f8-4368-4678-94ff-3960e28e3630": "kubelogin", // kubelogin
+  // AzureCloud
+  "https://management.core.windows.net/": "",
+  "https://management.azure.com/": "",
+  "https://vault.azure.net": "keyvault",
+  "https://datalake.azure.net/": "datalake",
+  "https://digitaltwins.azure.net": "digitaltwins01",
+  "0b07f429-9f4b-4714-9392-cc5e8e80c8b0": "digitaltwins02",
+  "https://outlook.office365.com/": "office365",
+  "https://graph.microsoft.com/": "microsoft.graph",
+  "https://batch.core.windows.net/": "azurebatch",
+  "https://analysis.windows.net/powerbi/api": "powerbi",
+  "https://rest.media.azure.net": "media",
+  "https://api.loganalytics.io": "loganalytics",
+  "https://ossrdbms-aad.database.windows.net": "ossrdbms",
+  "822c8694-ad95-4735-9c55-256f7db2f9b4": "iotplugplay",
+  "https://dev.azuresynapse.net": "azuresynapse",
+  "https://database.windows.net": "database",
+  "https://quantum.microsoft.com": "microsoft.quantum",
+  "https://iothubs.azure.net": "iothub",
+  "https://azuredatabricks.net/": "databricks1",
+  "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d": "databricks2",
+  "ce34e7e5-485f-4d76-964f-b3d2b16d1e4f": "azuregrafana",
+  "https://managedhsm.azure.net": "managedhsm",
+  "499b84ac-1321-427f-aa17-267ca6975798": "devops",
+  "https://api.adu.microsoft.com/": "deviceupdate",
+  "https://purview.azure.net/": "purview",
+  "https://cognitiveservices.azure.com": "https://cognitiveservices.azure.com",
+  "48ac35b8-9aa8-4d74-927d-1f4a14a0b239": "48ac35b8-9aa8-4d74-927d-1f4a14a0b239", //IC3 tenant admin gateway service
+  // AzureUSGovernment
+  "https://management.core.usgovcloudapi.net/": "",
+  "https://management.usgovcloudapi.net/": "",
+  "https://vault.usgovcloudapi.net": "keyvault",
+  "https://datalake.usgovcloudapi.net/": "datalake",
+  "https://outlook.office365.us/": "office365",
+  "https://graph.microsoft.us/": "microsoft.graph",
+  "https://batch.core.usgovcloudapi.net/": "azurebatch",
+  "https://analysis.usgovcloudapi.net/powerbi/api": "powerbi",
+  "https://rest.media.usgovcloudapi.net": "media",
+  "https://api.loganalytics.us": "loganalytics",
+  "https://ossrdbms-aad.database.usgovcloudapi.net": "ossrdbms",
+  "https://dev.azuresynapse.usgovcloudapi.net": "azuresynapse",
+  "https://database.usgovcloudapi.net/": "database",
+  "https://managedhsm.usgovcloudapi.net": "managedhsm",
+  // AzureUSNat
+  "https://management.core.eaglex.ic.gov/": "",
+  "https://management.azure.eaglex.ic.gov/": "",
+  "https://graph.cloudapi.eaglex.ic.gov/": "graph",
+  "https://vault.cloudapi.eaglex.ic.gov": "keyvault",
+  "https://datalake.cloudapi.eaglex.ic.gov/": "datalake",
+  "https://outlook.office365.eaglex.ic.gov/": "office365",
+  "https://graph.eaglex.ic.gov/": "microsoft.graph",
+  "https://batch.core.eaglex.ic.gov/": "azurebatch",
+  "https://analysis.cloudapi.eaglex.ic.gov/powerbi/api": "powerbi",
+  "https://storage.azure.eaglex.ic.gov/": "storage",
+  "https://rest.media.cloudapi.eaglex.ic.gov": "media",
+  "https://api.loganalytics.azure.eaglex.ic.gov": "loganalytics",
+  "https://ossrdbms-aad.database.database.cloudapi.eaglex.ic.gov": "ossrdbms",
+  // AzureUSSec
+  "https://management.core.microsoft.scloud/": "",
+  "https://management.azure.microsoft.scloud/": "",
+  "https://graph.cloudapi.microsoft.scloud/": "graph",
+  "https://vault.cloudapi.microsoft.scloud": "keyvault",
+  "https://datalake.cloudapi.microsoft.scloud/": "datalake",
+  "https://outlook.office365.microsoft.scloud/": "office365",
+  "https://graph.microsoft.scloud/": "microsoft.graph",
+  "https://batch.core.microsoft.scloud/": "azurebatch",
+  "https://analysis.cloudapi.microsoft.scloud/powerbi/api": "powerbi",
+  "https://storage.azure.microsoft.scloud/": "storage",
+  "https://rest.media.cloudapi.microsoft.scloud": "media",
+  "https://api.loganalytics.azure.microsoft.scloud": "loganalytics",
+  "https://ossrdbms-aad.database.database.cloudapi.microsoft.scloud": "ossrdbms"
+};
+
+var currentFontSize;
+var currentFontStyle;
+var currentOpenPort = getFromLocalStorage('currentOpenPort');
+
+var linksToOpen = {};
+var defaultHeight = true;
+
+const OsType = {
+  Linux: "linux",
+  Windows: "windows",
+
+  IsLinux: function (osType) {
+    return (typeof osType !== "undefined" && osType !== null && osType.toLowerCase() === OsType.Linux);
+  },
+  IsWindows: function (osType) {
+    return (typeof osType !== "undefined" && osType !== null && osType.toLowerCase() === OsType.Windows);
+  }
+}
+
+const ShellType = {
+  Bash: "bash",
+  PowerShellCore: "pwsh",
+
+  IsPowerShell: function (shellType) {
+    return (typeof shellType !== "undefined"
+      && shellType !== null
+      && shellType.toLowerCase() === ShellType.PowerShellCore);
+  },
+  MappingFromOsType: function (osType) {
+    if (osType) {
+      return (OsType.IsWindows(osType) ? ShellType.PowerShellCore : ShellType.Bash);
+    }
+    else {
+      return null;
+    }
+  }
+}
+
+const NetworkType = {
+  Default: "Default",
+  Isolated: "Isolated"
+}
+
+const SessionType = {
+  Mounted: "Mounted",
+  Ephemeral: "Ephemeral"
+}
+
+// The prefererence of osType and shellType.
+var osTypeSelection = OsType.Linux;
+var shellTypeSelection = ShellType.Bash;
+var networkTypeSelection = NetworkType.Default;
+
+var screenReaderMode;
+
+// used for handling delayed resizing
+var rtime;
+var timeout = false;
+var delta = 200;
+// Initialize terminal idle timeout to 20 mins.
+var terminalIdleTimeout = 20;
+
+var validResourceGroups = {};
+
+var terminalContainer;
+const fitAddon = new FitAddon.FitAddon();
+var attachAddon;
+
+var ConnectionState = {
+  NotConnected: 0,
+  Connecting: 1,
+  Connected: 2
+};
+
+var consoleApiVersion = '2023-02-01-preview';
+var armApiVersion = '2018-07-01';
+var storageApiVersion = '2022-09-01';
+var armApiversion2022 = '2022-12-01';
+var cloudShellProviderNameSpace = 'Microsoft.CloudShell';
+
+var storage = {};
+var virtualNetwork;
+
+var logger;
+var fileManager;
+var commands;
+
+(function () {
+  if (typeof window.CustomEvent === "function") {
+    return false;
+  }
+
+  function CustomEvent(event, params) {
+    params = params || { bubbles: false, cancelable: false, detail: undefined };
+    var evt = document.createEvent('CustomEvent');
+    evt.initCustomEvent(event, params.bubbles, params.cancelable, params.detail);
+    return evt;
+  }
+
+  CustomEvent.prototype = window.Event.prototype;
+  window.CustomEvent = CustomEvent;
+})();
+
+function userBrowserIE() {
+  return (navigator.userAgent.indexOf("MSIE") > 0 || navigator.userAgent.indexOf("Trident/") > 0);
+}
+
+function userBrowserFirefox() {
+  return navigator.userAgent.indexOf("Firefox") > 0;
+}
+
+function userBrowserEdge() {
+  return navigator.userAgent.indexOf("Edge") > -1;
+}
+
+function isSecureCloud() {
+  return $("#arm-audience").attr("value").indexOf("eaglex") > -1 || $("#arm-audience").attr("value").indexOf("microsoft.scloud") > -1;
+}
+
+function isUSGovCloud() {
+  return $("#arm-audience").attr("value").indexOf("usgov") > -1;
+}
+
+function isUSNatCloud() {
+  return $("#arm-audience").attr("value").indexOf("eaglex") > -1;
+}
+
+function isUSSecCloud() {
+  return $("#arm-audience").attr("value").indexOf("scloud") > -1;
+}
+
+// currently ux v2 for redirecting is only available in the rc endpoint
+// this will be expanded to include more endpoints
+function isUX2Available() {
+  return window.location.href.includes("rc.");
+}
+
+function userBrowserChrome() {
+  var isChromium = window.chrome;
+  var vendorName = navigator.vendor;
+  var isOpera = typeof window.opr !== "undefined";
+  var isIOSChrome = navigator.userAgent.match("CriOS");
+
+  if (isIOSChrome) {
+    return true;
+  } else if (isChromium !== null && typeof isChromium !== "undefined" && vendorName.indexOf("Google Inc.") > -1 && !isOpera && !userBrowserEdge()) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+function setupParentMessage() {
+  // --------------------------------------- Security Code ---------------------------------------
+  var allowedParentFrameAuthorities = ["localhost:3000", "portal.azure.com", "portal.azure.us", "rc.portal.azure.com", "ms.portal.azure.com", "docs.microsoft.com", "review.docs.microsoft.com", "ppe.docs.microsoft.com", "ux.console.azure.us", "admin-local.teams.microsoft.net", "admin-ignite.microsoft.com", "wusportalprv.office.com", "portal-sdf.office.com", "ncuportalprv.office.com", "admin.microsoft.com", "portal.microsoft.com", "portal.office.com", "admin.microsoft365.com", "admin-sdf.exchange.microsoft.com", "admin.exchange.microsoft.com", "cloudconsole-ux-prod-usnatwest.appservice.eaglex.ic.gov", "cloudconsole-ux-prod-usnateast.appservice.eaglex.ic.gov", "portal.azure.eaglex.ic.gov", "cloudconsole-ux-prod-ussecwest.appservice.microsoft.scloud", "cloudconsole-ux-prod-usseceast.appservice.microsoft.scloud", "portal.azure.microsoft.scloud", "admin-local.teams.microsoft.net", "admin-dev.teams.microsoft.net", "admin-int.teams.microsoft.net", "admin.teams.microsoft.com", "preview.portal.azure.com", "learn.microsoft.com", "review.learn.microsoft.com", "ppe.learn.microsoft.com", "dev.learn.microsoft.com"];
+
+  function handleToken(evt) {
+
+    var authToken = evt.data.message;
+    var validAudienceList = ['', 'arm', 'graph', 'keyvault', 'datalake', 'office365', 'azurebatch', 'microsoft.graph', 'powerbi', 'storage', 'media', 'loganalytics', 'ossrdbms', 'yammer', 'digitaltwins01', 'digitaltwins02', 'iotplugplay', 'azuresynapse', 'database', 'microsoft.quantum', 'iothub', 'ssh1', 'ssh2', 'databricks1', 'databricks2', 'azuregrafana', 'devicesprovisioning', 'managedhsm', "devops", "deviceupdate", "purview", "6dae42f8-4368-4678-94ff-3960e28e3630", "kubelogin", "https://cognitiveservices.azure.com", "48ac35b8-9aa8-4d74-927d-1f4a14a0b239"];
+
+    if (!authToken) {
+      console.error("No auth token in event, event: " + JSON.stringify(evt));
+      return;
+    } else if (validAudienceList.indexOf(evt.data.audience) >= 0) {
+      if (evt.data.audience == 'arm' || evt.data.audience == '') {
+        accessToken = authToken;
+        var claims = jwt_decode(accessToken);
+        tenantId = claims.tid;
+        puid = (claims.puid || claims.altsecid.split(",")[0].split(":")[2]).toLowerCase();
+        if (popout) {
+          populateDirectoryInfo(claims);
+        }
+        createOrUpdateTerminal();
+      }
+      if (evt.data.audience.includes("ssh")) {
+        postCert(authToken);
+      }
+      else {
+        postToken(authToken);
+      }
+    } else {
+      logger.clientTelemetry('ACC.TOKEN.INVALID', { "audience": evt.data.audience, "puid": puid }, {}, 0);
+      console.error("Audience '" + evt.data.audience + "' cannot be handled.");
+    }
+  }
+
+  function handleCommandInjection(evt) {
+    var commandBody = evt.data.message;
+    var commandShellType = evt.data.cliType;
+    if(commandShellType.cliType) {
+      commandShellType = commandShellType.cliType
+    }
+    if (commandShellType === "powershell") {
+      commandShellType = ShellType.PowerShellCore;
+    }
+    injectedCommands = handleCommandEvtBody(commandBody, logger);
+    if (activeSession) {
+      if (commandShellType !== shellTypeSelection) {
+        addToLocalStorage('injectedCommands', injectedCommands);
+        showSwitchShellTypeConfirmation(commandShellType);
+      }
+      else {
+        hideTerminal();
+        $("#command-reload-confirmation").show();
+        enterClickHandler($("#confirm-command-reload"), function () {
+          showTerminal();
+          createTerminal();
+          $("#confirm-command-reload").off();
+        });
+      }
+    }
+    else {
+      addToLocalStorage('injectedCommands', injectedCommands);
+      saveSessionConsoleShellType(commandShellType);
+    }
+  }
+
+  function postToken(token) {
+    if (consoleUri) {
+      var method = 'POST';
+
+      var targetUri = consoleUri + '/accessToken';
+      var start = Date.now();
+      var newToken = { token: token };
+
+      $.ajax(targetUri,
+        {
+          method: method,
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': accessToken,
+            'Accept-Language': language
+          },
+          data: JSON.stringify(newToken)
+        })
+        .fail(function (jqXHR, textStatus, errorThrown) {
+          logger.clientRequest('ACC.POST.TOKEN', { "puid": puid }, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+        })
+        .done(function (data, textStatus, jqXHR) {
+          logger.clientRequest('ACC.POST.TOKEN', { "puid": puid }, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+        });
+    }
+  }
+
+  function postCert(tokenData) {
+    if (consoleUri) {
+      var method = 'POST';
+
+      var targetUri = consoleUri + '/ephemeralCert';
+      var start = Date.now();
+
+      // the data we send to the agent should have a tokenType parameter separate from the cert in the header
+      // the token we get from Portal has tokenType = "ssh-cert" attribute and "ssh-cert" in the beginning of the header
+      // so we need to check that the tokenType is in the header and not a separate parameter and then split it out.
+      if (tokenData.header.indexOf(" ") != -1) {
+        if(!tokenData.tokenType) {
+          tokenData.tokenType = tokenData.header.split(" ")[0];
+        }
+        tokenData.header = tokenData.header.split(" ")[1];
+      }
+
+      $.ajax(targetUri,
+        {
+          method: method,
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': accessToken,
+            'Accept-Language': language
+          },
+          data: JSON.stringify({ token: tokenData })
+        })
+        .fail(function (jqXHR, textStatus, errorThrown) {
+          logger.clientRequest('ACC.POST.CERT', { "puid": puid }, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+        })
+        .done(function (data, textStatus, jqXHR) {
+          logger.clientRequest('ACC.POST.CERT', { "puid": puid }, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+        });
+    }
+  }
+
+  var isTrustedOrigin = (function () {
+    trustedAuthority = (trustedParentOrigin.split("//")[1] || "").toLowerCase();
+    return allowedParentFrameAuthorities.some(function (origin) {
+      // Verify that the requested trusted authority is an allowed origin
+      return origin === trustedAuthority;
+    });
+  })();
+
+  if (!isTrustedOrigin) {
+    var errorMessage = "The origin '" + trustedParentOrigin + "' is not trusted.";
+    console.error(errorMessage);
+    throw new Error(errorMessage);
+  }
+
+  trustedAuthority = (trustedParentOrigin.indexOf("https") == 0 ? "https://" : "http://") + trustedAuthority;
+
+  function postMessageHandler(evt) {
+    if (evt.origin !== trustedParentOrigin) {
+      return;
+    }
+
+    var data = evt.data || {};
+    if (data.signature === "portalConsole") {
+      switch (data.type) {
+        case "postToken":
+          handleToken(evt);
+          break;
+        case "restart":
+          restartTerminal();
+          break;
+        case "postConfig":
+          if (data.fullScreen) {
+            $("#terminal-maximize").hide();
+            $("#terminal-restore").show();
+          }
+          // example data.cliOptions :
+          // { cliType: "bash", cliOptions: { ephemeral: true, subscriptionID: "sID" } -- extension is using the new framework options
+          // { cliType: "bash" } -- extension is using the old options. cliType is required by Portal Framework, cliOptions are not
+          // null -- no options. e.g. when launching cloud shell normally in portal
+          if (data.cliOptions) {
+            var options = data.cliOptions;
+            if (options.cliOptions) {
+              var cliOptions = options.cliOptions;
+              ephemeralSession = cliOptions.ephemeral;
+              userSubscription = cliOptions.subscriptionId;
+            }
+            if (options.cliType) {
+              saveSessionConsoleShellType(options.cliType);
+            }
+          }
+          break;
+        case "postCommand":
+          handleCommandInjection(evt);
+          break;
+        default:
+          console.log("message received " + data.message);
+      }
+    }
+  }
+
+  window.addEventListener("message", postMessageHandler, false);
+
+  getTokens();
+  getConfig();
+  getCommands();
+}
+
+function createOrUpdateTerminal() {
+  if (!term) {
+    createTerminal();
+  }
+  else if (term.connectionState === ConnectionState.Connecting) {
+    window.setTimeout(createOrUpdateTerminal, 500);
+  }
+  else if (term.connectionState === ConnectionState.Connected) {
+    window.setTimeout(keepAlive, 500);
+  }
+  else {
+    provisionConsole();
+  }
+}
+
+function getARMEndpoint() {
+  if ($("#arm-audience").attr("value")) {
+    return $("#arm-audience").attr("value")
+  }
+  else {
+    return "https://management.azure.com"
+  }
+}
+
+function getConsoleUri() {
+  var resourceId = '/consoles/default';
+  return getARMEndpoint() + '/providers/Microsoft.Portal' + getAzureConsoleProviderLocation() + resourceId + '?api-version=' + consoleApiVersion;
+}
+
+function getAzureConsoleProviderLocation() {
+  var providerLocation = '';
+  if (getQueryParameter('feature.azureconsole.providerlocation')) {
+    providerLocation = '/locations/' + getQueryParameter('feature.azureconsole.providerlocation');
+  }
+  return providerLocation;
+}
+
+function showTerminal() {
+  if (!embed) {
+    $('#terminal-header').show();
+  }
+  $('#terminal-container').show();
+  $('#terminal-dialog-back').hide();
+}
+
+function hideTerminal() {
+  $('#terminal-dialog-back').show();
+  $('#terminal-header').hide();
+  $('#terminal-container').hide();
+}
+
+function saveSessionConsoleShellType(shellType) {
+  try {
+    window.sessionStorage.setItem('consoleShellType', shellType);
+  }
+  catch (e) { }
+}
+
+function getAndRemoveSessionConsoleShellType() {
+  try {
+    var shellType = window.sessionStorage.getItem('consoleShellType');
+    window.sessionStorage.removeItem('consoleShellType');
+    return shellType;
+  }
+  catch (e) {
+    return null;
+  }
+}
+
+function showSwitchShellTypeConfirmation(shellType) {
+  if (ShellType.IsPowerShell(shellType)) {
+    $("#switch-shell-ps-head").show();
+    $("#switch-shell-ps-text").show();
+    $("#switch-shell-bash-head").hide();
+    $("#switch-shell-bash-text").hide();
+  } else {
+    $("#switch-shell-ps-head").hide();
+    $("#switch-shell-ps-text").hide();
+    $("#switch-shell-bash-head").show();
+    $("#switch-shell-bash-text").show();
+  }
+
+  $('#confirm-switch-shell').off('keypress click keydown');
+  $('#cancel-switch-shell').off('keydown');
+  enterClickHandler($("#confirm-switch-shell"), function () {
+    saveSessionConsoleShellType(shellType);
+    $("#terminal-restart-confirmation").hide();
+    $("#terminal-reset-user-settings-confirmation").hide();
+    $("#terminal-switch-shell-confirmation").hide();
+    showTerminal();
+    switchTerminal();
+  });
+
+  arrowKeyHandler($("#confirm-switch-shell"), "right", function () {
+    $("#cancel-switch-shell").focus();
+  });
+
+  arrowKeyHandler($("#cancel-switch-shell"), "left", function () {
+    $("#confirm-switch-shell").focus();
+  });
+
+  hideTerminal();
+  $("#terminal-storage-creation").hide();
+  $("#terminal-switch-shell-confirmation").show();
+  $("#confirm-switch-shell").focus();
+}
+
+function updateFileServiceLink() {
+  var storageProfile = getStorageProfile(userSettings);
+  var storageAccountResourceId = storageProfile.storageAccountResourceId;
+  fetchVnetInfo(storageAccountResourceId);
+  var fileShareName = storageProfile.fileShareName;
+  var cloudShellLink = $("#portal-host").attr("value") + tenantId + "/resource/" + storageAccountResourceId + "/fileList";
+  enterClickHandler($("#file-upload-blade"), function () {
+    if (popout) {
+      window.open(cloudShellLink, '_blank');
+    }
+    else {
+      postMessageHelper("openFileShare", { resourceId: storageAccountResourceId, fileShare: fileShareName });
+    }
+  });
+}
+
+
+function checkUserSettings(callback, correlationId = null) {
+  var userLocation, assignedLocation, subscriptions, userLocationCode, locationName, storageAccountResourceId, resourceGroups, storageAccounts;
+  var retryLimit = 3, retryLimitForGetStorageAccount = 20;
+  showAdvancedSettings = false;
+  var inputError = false;
+
+  $(".advanced-link-text").off("click");
+  $("#terminal-storage-creation-subscriptions").off("change");
+  $("#resource-group-select-entry").off("change");
+
+  $(".advanced-link-text").on("click", toggleAdvancedSettings);
+  $('#terminal-storage-creation-subscriptions').on("change", function () {
+    validateStorageSupport();
+    getResourceGroups(0, $('#terminal-storage-creation-subscriptions').val());
+  });
+
+  $("#resource-group-select-entry").on("change", function () {
+    //$("#vnet-settings-checkbox").change();
+    if (!$("#create-new-rg").prop('checked') || usingVnetOptions()) {
+      getStorageAccounts(0, $('#terminal-storage-creation-subscriptions').val(), $("#resource-group-select-entry").val());
+      displayVnetOptions();
+    }
+  });
+
+  hideTerminal();
+  getUserSettings(0, correlationId);
+
+  function showUnknownFailure(messageText) {
+    if (messageText) {
+      $("#terminal-dialog-unknown-failure .terminal-dialog-text").text(messageText);
+      $("#terminal-dialog-unknown-failure .terminal-dialog-text").attr("aria-label", "Could not download, try again.");
+    }
+    $("#terminal-dialog-unknown-failure").show();
+    $("#unknown-failure-close").focus();
+  }
+
+  function handleShellType(shellType, callback) {
+    if (!shellType || shellType.toLowerCase() === "notspecified") {
+      hideTerminal();
+      $("#terminal-ostype-selection").show()
+      $("#os-bash-option").focus();
+      $('.os-option').off('keypress click');
+      $('.os-option').on('keypress click', function (e) {
+        shellType = $(this).attr('shell-type');
+
+        $("#terminal-ostype-selection").hide();
+        setupShellType(shellType);
+        callback();
+      });
+    }
+    else {
+      setupShellType(shellType);
+      callback();
+    }
+  }
+
+  function setupShellType(userSettingShellType) {
+    var featureOsType = getQueryParameter("feature.azureconsole.ostype");
+    var featureShellType = ShellType.MappingFromOsType(featureOsType);
+
+    shellTypeSelection = getAndRemoveSessionConsoleShellType() || featureShellType || userSettingShellType;
+
+    var showList = [];
+    var hideList = [];
+    var otherShellType = '';
+    var selectOtherShellType = '';
+
+    if (ShellType.IsPowerShell(shellTypeSelection)) {
+      $('#powershellstyle').prop('disabled', false);
+      if ($("#cloudshell-header").css("background-color") === "rgb(0, 0, 0)") {
+        backgroundColors["pwsh"] = "#000000";
+      }
+      updateTerminalBackgroundColor(ShellType.PowerShellCore);
+      $('#environment-selection').html("PowerShell");
+      $('#environment-selection').attr("aria-label", "Selecting PowerShell");
+      showList = ['#bash-terminal-selector', '#terminal-psdoc'];
+      hideList = ['#powershell-terminal-selector', '#terminal-clidoc'];
+      otherShellType = ShellType.Bash;
+      selectOtherShellType = '#bash-terminal-selector';
+    }
+    else {
+      $('#powershellstyle').prop('disabled', true);
+      updateTerminalBackgroundColor(ShellType.Bash);
+      $('#environment-selection').html("Bash");
+      $('#environment-selection').attr("aria-label", "Selecting Bash");
+      showList = ['#powershell-terminal-selector', '#terminal-clidoc'];
+      hideList = ['#bash-terminal-selector', '#terminal-psdoc'];
+      otherShellType = ShellType.PowerShellCore;
+      selectOtherShellType = '#powershell-terminal-selector';
+    }
+
+    for (var i = 0; i < showList.length; i++) {
+      $(showList[i]).show();
+    }
+
+    for (var i = 0; i < hideList.length; i++) {
+      $(hideList[i]).hide();
+    }
+
+    $(selectOtherShellType).off('keypress click');
+    enterClickHandler($(selectOtherShellType), function (e) {
+      showSwitchShellTypeConfirmation(otherShellType);
+    });
+
+    // Add osType, shellType and networkType data to logger.
+    logger.addBaseEventData({ osType: osTypeSelection, shellType: shellTypeSelection, networkType: networkTypeSelection });
+  }
+
+  function createEphemeralSessionSettings(correlationId = null) {
+    var start = Date.now();
+    putUserSettings({
+      properties: {
+        preferredOsType: osTypeSelection,
+        preferredShellType: shellTypeSelection,
+        preferredLocation: userLocation,
+        networkType: NetworkType.Default,
+        sessionType: SessionType.Ephemeral,
+        userSubscription: userSubscription,
+      }
+    }, function (jqXHR, textStatus, errorThrown) {
+      logger.clientRequest('ACC.PUTUSERSETTINGS.FAILURE', { "puid": puid }, Date.now() - start, 'PUT', "", null, null, null, null, jqXHR.status);
+    }, function (data, textStatus, jqXHR) {
+      logger.clientRequest('ACC.PUTUSERSETTINGS.SUCCEED', { "puid": puid }, Date.now() - start, 'PUT', "", null, null, null, null, jqXHR.status);
+      getUserSettings(0, correlationId);
+    });
+  }
+
+  function getUserSettings(retryCount, correlationId = null) {
+    loadUserSettings(
+      function (jqXHR, textStatus, errorThrown, start, targetUri) {
+        if (jqXHR.status === 404) {
+          locationName = jqXHR.getResponseHeader("x-ms-console-required-location");
+          storage.location = userLocation = assignedLocation = locationName.replace(/ /g, "").toLowerCase();
+          userLocationCode = jqXHR.getResponseHeader("x-ms-console-required-location-code");
+          if (ephemeralSession) {
+            handleShellType(null, function () { createEphemeralSessionSettings(correlationId); });
+          }
+          else {
+            handleShellType(null, function () { getSubscriptions(0); });
+          }
+        }
+        else if (jqXHR.responseJSON.error.code === 'UserNotEnabledForPreview') {
+          window.location.replace("rollingout.html" + window.location.search);
+        }
+        else if (jqXHR.status > 399 && jqXHR.status < 500) {
+          var message = (!!jqXHR.responseJSON && !!jqXHR.responseJSON.error && !!jqXHR.responseJSON.error.message) ? jqXHR.responseJSON.error.message : null;
+          hideTerminal();
+          showUnknownFailure(message);
+        }
+        else {
+          logger.clientRequest('ACC.USERSETTINGS.GET', {}, Date.now() - start, 'GET', targetUri, null, null, null, null, jqXHR.status, correlationId);
+          if (++retryCount < retryLimit) {
+            getUserSettings(retryCount, correlationId);
+          }
+          else {
+            hideTerminal();
+            showUnknownFailure();
+          }
+        }
+      },
+      function (data, textStatus, jqXHR) {
+        userSettings = data.properties;
+        ephemeralSession = userSettings.sessionType == SessionType.Ephemeral;
+
+        if (popout) {
+          displayUserSettings();
+        }
+        showTerminal();
+        updateFontSize(userSettings.terminalSettings.fontSize.toLowerCase());
+        updateFontStyle(userSettings.terminalSettings.fontStyle.toLowerCase());
+        locationName = userSettings.preferredLocation;
+        storage.location = userLocation = assignedLocation = locationName.replace(/ /g, "").toLowerCase();
+        userLocationCode = jqXHR.getResponseHeader("x-ms-console-required-location-code");
+        networkTypeSelection = userSettings.networkType;
+        var storageProfile = getStorageProfile(userSettings);
+        if (!ephemeralSession) {
+          storageAccountResourceId = storageProfile.storageAccountResourceId;
+        }
+        verifyUserSettings(data);
+
+        var userSettingsSubscriptionId = getUserSettingsSubscriptionId(data.properties);
+        if (userSettingsSubscriptionId != null) {
+          verifyCloudShellProviderRegistration(userSettingsSubscriptionId)
+        }
+      },
+      function () { },
+      correlationId
+    );
+  }
+
+  function verifyUserSettings(data) {
+    var targetUri = getARMEndpoint() + storageAccountResourceId + '?api-version=' + storageApiVersion;
+    $.ajax(targetUri,
+      {
+        method: "GET",
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language,
+        }
+      }).fail(function (jqXHR, textStatus, errorThrown) {
+        data.properties.storageProfile = null;
+      })
+      .always(function () {
+        if (!userSettings.preferredShellType) {
+          userSettings.preferredShellType = OsType.IsWindows(userSettings.preferredOsType) ? ShellType.PowerShellCore : ShellType.Bash;
+          userSettings.preferredOsType = OsType.Linux;
+          data.properties = userSettings;
+          putUserSettings(data, function () { }, function () { });
+        }
+        handleShellType(userSettings.preferredShellType, function () {
+          if (data.properties.storageProfile != null) {
+            updateFileServiceLink();
+            callback();
+          }
+          else if (ephemeralSession) {
+            callback();
+          }
+          else {
+            getSubscriptions(0);
+          }
+        });
+      });
+  }
+
+  function getSubscriptions(retryCount) {
+    hideTerminal();
+    var targetUri = getARMEndpoint() + '/subscriptions?api-version=' + armApiVersion;
+    subscriptions = [];
+    getSubscriptionsInternal(retryCount, targetUri);
+  }
+
+  function getSubscriptionsInternal(retryCount, targetUri) {
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.SUBSCRIPTIONS.LIST', {}, Date.now() - start, 'GET', targetUri, null, null, null, null, jqXHR.status);
+        if (++retryCount < retryLimit) {
+          getSubscriptionsInternal(retryCount, targetUri);
+        }
+        else {
+          showUnknownFailure();
+        }
+
+      })
+      .done(function (data, textStatus, jqXHR) {
+        subscriptions = data.value ? subscriptions.concat(data.value) : subscriptions;
+        if (data.nextLink) {
+          getSubscriptionsInternal(retryCount, data.nextLink);
+        }
+        else {
+          subscriptions = subscriptions.filter(function (s) { return s.state != "Disabled" && s.state != "Deleted"; });
+          if (subscriptions.length === 0) {
+            $("#terminal-dialog-nosubscription").show();
+            $("#nosubscription-close").focus();
+          }
+          else {
+            populateSubscriptions();
+            $('#terminal-storage-creation-text').show();
+            $('#terminal-dialog-rg_storage-creation-failure').hide();
+            $('#terminal-storage-creation-footer').show();
+            $('.message-storage-subscriptions-choice').show();
+            $("#terminal-storage-creation").show();
+            $("#terminal-storage-creation-subscriptions").focus();
+          }
+        }
+      });
+  }
+
+  function validateStorageSupport() {
+    var index = $('#terminal-storage-creation-subscriptions')[0].selectedIndex;
+    if (index < 0) {
+      return;
+    }
+    //USNat and USSec subscriptions don't have policy details, skip the check
+    if (isSecureCloud()) {
+      updateCreateButton();
+    }
+    else {
+      var quotaId = subscriptions[index].subscriptionPolicies.quotaId;
+      if (quotaId == 'DreamSpark_2015-02-01') {
+        $("#terminal-storage-creation-create").prop("disabled", true);
+        $("#terminal-storage-creation-disabled-note").show();
+      }
+      else {
+        if (showAdvancedSettings) {
+          updateCreateButton();
+        }
+        else {
+          $("#terminal-storage-creation-create").prop("disabled", false);
+        }
+        $("#terminal-storage-creation-disabled-note").hide();
+      }
+    }
+  }
+
+  function getResourceGroups(retryCount, sid) {
+    var resourceArg = '/subscriptions/' + sid + '/resourceGroups';
+    var targetUri = getARMEndpoint() + resourceArg + '?api-version=2017-05-10';
+    resourceGroups = [];
+    getResourceGroupsInternal(retryCount, sid, targetUri);
+  }
+
+  function getResourceGroupsInternal(retryCount, sid, targetUri) {
+    var start = Date.now();
+    var method = 'GET';
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.RESOURCEGROUPS.LIST', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+        if (++retryCount < retryLimit) {
+          getResourceGroupsInternal(retryCount, sid, targetUri);
+        }
+      })
+      .done(function (data, textStatus, jqXHR) {
+        resourceGroups = data.value ? resourceGroups.concat(data.value) : resourceGroups;
+        if (data.nextLink) {
+          getResourceGroupsInternal(retryCount, sid, data.nextLink);
+        }
+        else {
+          populateResourceGroups(resourceGroups, sid);
+        }
+      });
+  }
+
+  function getStorageAccounts(retryCount, sid, rg) {
+    var method = 'GET';
+    if (validResourceGroups[sid] === undefined || (validResourceGroups[sid].length == 0 || validResourceGroups[sid].indexOf(rg) == -1)) {
+      console.log("Resource group " + rg + " is not in " + sid);
+      return;
+    }
+    var resourceArg = '/subscriptions/' + sid + '/resourceGroups/' + rg + '/providers/Microsoft.Storage/storageAccounts';
+    var targetUri = getARMEndpoint() + resourceArg + '?api-version=' + storageApiVersion;
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.STORAGEACCOUNTS.LIST', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+        if (++retryCount < retryLimit) {
+          getStorageAccounts(retryCount, sid, rg);
+        }
+      })
+      .done(function (data, textStatus, jqXHR) {
+        populateStorageAccounts(data);
+      });
+  }
+
+  function verifyCloudShellProviderRegistration(subscriptionId) {
+    var method = 'GET';
+    var resourceArg = '/subscriptions/' + subscriptionId + '/providers/' + cloudShellProviderNameSpace;
+    var targetUri = getARMEndpoint() + resourceArg + '?api-version=' + armApiversion2022;
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.CLOUDSHELLPROVIDER.GET', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+      })
+      .done(function (data, textStatus, jqXHR) {
+        logger.clientTelemetry('ACC.CLOUDSHELLPROVIDER.GET', { "subscriptionId": subscriptionId, "SubscriptionState": data.registrationState }, {}, Date.now() - start)
+        if (data.registrationState != "Registered") {
+          registerCloudShellProvider(subscriptionId);
+        }
+      });
+  }
+
+  function registerCloudShellProvider(subscriptionId) {
+    var method = 'POST';
+    var resourceArg = '/subscriptions/' + subscriptionId + '/providers/' + cloudShellProviderNameSpace + '/register';
+    var targetUri = getARMEndpoint() + resourceArg + '?api-version=' + armApiversion2022;
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Content-Length': 0,
+          'Content-Type': 'application/json',
+          'Authorization': accessToken
+        }
+      })
+      .fail(function (jqXHR, textStatus) {
+        logger.clientRequest('ACC.CLOUDSHELLPROVIDERREGISTRATION.FAILURE', { "subscriptionId": subscriptionId, "armresponse": jqXHR.responseJSON }, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+      })
+      .done(function (data, textStatus, jqXHR) {
+        logger.clientRequest('ACC.CLOUDSHELLPROVIDERREGISTRATION.SUCCEED', { "subscriptionId": subscriptionId }, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+      });
+  }
+
+  function disableExisting(existing, options, message) {
+    existing.attr("disabled", true);
+    existing.prop("checked", false);
+    options.attr("data-toggle", "tooltip");
+    options.attr("title", message);
+  }
+
+  function enableExisting(existing, options) {
+    existing.attr("disabled", false);
+    options.removeAttr("data-toggle");
+    options.removeAttr("title");
+  }
+
+  function populateDropdown(options, selection) {
+    options.sort(function (a, b) {
+      return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+    });
+    $(selection).find('option').remove();
+    $.each(options, function (i, item) {
+      $(selection).append($('<option>', {
+        value: item.name,
+        text: item.name
+      }));
+    });
+  }
+
+  function populateStorageAccountDropdown(options, selection) {
+    options.sort(function (a, b) {
+      return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+    });
+    $(selection).find('option').remove();
+    $.each(options, function (i, item) {
+      $(selection).append($('<option>', {
+        value: item.name + "-" + item.sku.tier,
+        text: item.name
+      }));
+    });
+  }
+
+  function updateStorageAccountButtons() {
+    var tooltipMessage = $("#file-share-buttons").attr("tooltip");
+    if ($("#create-new-sa").prop('checked')) {
+      $("#storage-account-text-entry").show();
+      $("#storage-account-select").hide();
+      $("#create-new-fs").prop("checked", true);
+      disableExisting($("#use-existing-fs"), $('#file-share-buttons'), tooltipMessage);
+    }
+    else {
+      $("#storage-account-text-entry").hide();
+      $("#storage-account-select").show();
+      enableExisting($("#use-existing-fs"), $('#file-share-buttons'));
+    }
+  }
+
+  function updateResourceGroupButtons() {
+    var tooltipMessage = $("#storage-account-buttons").attr("tooltip1");
+    if ($("#create-new-rg").prop('checked')) {
+      disableExisting($("#use-existing-sa"), $("#storage-account-buttons"), tooltipMessage);
+      $("#create-new-sa").prop("checked", true);
+      updateStorageAccountButtons();
+      $("#resource-group-text-entry").show();
+      $("#resource-group-select").hide();
+    }
+    else {
+      $("#resource-group-text-entry").hide();
+      $("#resource-group-select").show();
+      enableExisting($("#use-existing-sa"), $("#storage-account-buttons"));
+      $("#resource-group-select-entry").trigger("change");
+    }
+  }
+
+  function populateLocationDropdown(options, selection) {
+    var locations = Object.keys(options).sort();
+    $(selection).find('option').remove();
+    for (var i = 0; i < locations.length; i++) {
+      var location = locations[i];
+      var optionGroup = location === storageLocationMapping[location] ? $("#primary-regions-options") : $("#secondary-regions-options");
+      $(optionGroup).append($('<option>', {
+        value: location,
+        text: options[location]
+      }));
+      $(optionGroup).show();
+    }
+  }
+
+  function displayRelayNamespaces() {
+    var sid = $('#terminal-storage-creation-subscriptions').val();
+    var rg = $("#resource-group-select-entry").val();
+
+    var method = 'GET';
+    var targetUri = getARMEndpoint() + '/subscriptions/' + sid + '/resourceGroups/' + rg + '/providers/Microsoft.Relay/namespaces?api-version=2017-04-01';
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.RELAYNAMESPACES.LIST', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+      })
+      .done(function (data, textStatus, jqXHR) {
+        populateRelayNamespaces(data);
+      });
+  }
+
+  function displayNetworkProfiles() {
+    var sid = $('#terminal-storage-creation-subscriptions').val();
+    var rg = $("#resource-group-select-entry").val();
+
+    var method = 'GET';
+    var targetUri = getARMEndpoint() + '/subscriptions/' + sid + '/resourceGroups/' + rg + '/providers/Microsoft.Network/networkProfiles?api-version=' + armApiVersion;
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.NETWORKPROFILES.LIST', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+      })
+      .done(function (data, textStatus, jqXHR) {
+        populateNetworkProfiles(data);
+      });
+  }
+
+  function displayVnetOptions() {
+    var sid = $('#terminal-storage-creation-subscriptions').val();
+    var rg = $("#resource-group-select-entry").val();
+    if (rg) {
+      if (validResourceGroups[sid] === undefined || (validResourceGroups[sid].length == 0 || validResourceGroups[sid].indexOf(rg) == -1)) {
+        console.log("Resource group " + rg + " is not in " + sid);
+        return;
+      }
+      var method = 'GET';
+      var targetUri = getARMEndpoint() + '/subscriptions/' + sid + '/resourceGroups/' + rg + '/providers/Microsoft.Network/virtualNetworks?api-version=' + armApiVersion;
+      var start = Date.now();
+      $.ajax(targetUri,
+        {
+          method: method,
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': accessToken,
+            'Accept-Language': language
+          }
+        })
+        .fail(function (jqXHR, textStatus, errorThrown) {
+          logger.clientRequest('ACC.VIRTUALNETWORKS.LIST', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+        })
+        .done(function (data, textStatus, jqXHR) {
+          populateVirtualNetworks(data);
+        });
+    }
+    else {
+      populateVirtualNetworks({ value: [] });
+    }
+  }
+
+  function toggleAdvancedSettings() {
+    showAdvancedSettings = !showAdvancedSettings;
+    if (showAdvancedSettings) {
+      $('#terminal-storage-creation-intro').hide(1000);
+      $("#show-advanced").hide();
+      $("#hide-advanced").show();
+      $("#advanced-link").css("padding-top", "30px");
+      $("#show-vnet-settings").show();
+      $(".message-storage-subscriptions-choice.row").animate({ 'padding-top': '0px' }, 1000);
+      $('#advanced-options').show(1000);
+      $("#subscription-selection-prompt").animate({ 'margin-left': '0px' }, 1000);
+      populateLocationDropdown(locationDisplayNames, $("#terminal-storage-select-location"));
+      $("#terminal-storage-select-location").val(userLocation);
+      $("#location-selection-prompt").show(1000);
+      $("#terminal-storage-creation-content").stop().animate({
+        scrollTop: $("#terminal-storage-creation-content")[0].scrollHeight
+      }, 1000);
+      if ($("#storage-note").attr("localized") === "false") {
+        $("#storage-note").html(format($("#storage-note").text(), $("#storage-note").attr("documentation-link"), $("#storage-note").attr("vnet-documentation-link")));
+        $("#storage-note").attr("localized", "true");
+      }
+      $('.option-buttons').on("change", function () {
+        var updatedButtonLabel;
+        if ($("#use-existing-fs").prop('checked') && $("#use-existing-sa").prop('checked') && $("#use-existing-rg").prop('checked')) {
+          updatedButtonLabel = $("#terminal-storage-creation-create").attr("attach-storage");
+        }
+        else {
+          updatedButtonLabel = $("#terminal-storage-creation-create").attr("create-storage");
+        }
+        $("#terminal-storage-creation-create").text(updatedButtonLabel);
+      });
+      $("#terminal-storage-select-location").on("change", function () {
+        userLocation = $("#terminal-storage-select-location").val();
+        window.setTimeout(function () { getStorageAccounts(0, $('#terminal-storage-creation-subscriptions').val(), $("#resource-group-select-entry").val()); }, 1000);
+      });
+      $("#storage-account-buttons").on("change", function () {
+        updateStorageAccountButtons();
+        updateCreateButton();
+      });
+      $("#resource-group-buttons").on("change", function () {
+        updateResourceGroupButtons();
+        updateCreateButton();
+      });
+      window.setTimeout(function () { getResourceGroups(0, $('#terminal-storage-creation-subscriptions').val()); }, 100);
+      updateCreateButton();
+      $("#vnet-settings-checkbox").on("change", function () {
+        if (usingVnetOptions()) {
+          $("label[for='vnet-settings-checkbox']").html($("#vnet-settings-checkbox").attr("hide-settings-text"));
+          $("#storage-account-select").css('padding-top', '2px');
+          $("#storage-account-input").css('padding-top', '0px');
+          $("#resource-group-select").css('padding-top', '2px');
+          $("#resource-group-input").css('padding-top', '0px');
+          $("#resource-group-text-entry").hide();
+          $("#resource-group-select").show();
+          $("#resource-group-select-entry").show();
+          $("#storage-account-text-entry").hide();
+          $("#storage-account-select").show();
+          $("#storage-account-select-entry").show();
+          $("#vnet-options").show();
+          $(".option-buttons").hide();
+          window.setTimeout(function () { getStorageAccounts(0, $('#terminal-storage-creation-subscriptions').val(), $("#resource-group-select-entry").val()); }, 100);
+        }
+        else {
+          $("label[for='vnet-settings-checkbox']").html($("#vnet-settings-checkbox").attr("show-settings-text"));
+          $("#vnet-options").hide();
+          $(".option-buttons").show();
+          $("#resource-group-input").css('padding-top', '');
+          $("#resource-group-select").css('padding-top', '');
+          $("#storage-account-input").css('padding-top', '');
+          $("#storage-account-select").css('padding-top', '');
+          window.setTimeout(function () { getStorageAccounts(0, $('#terminal-storage-creation-subscriptions').val(), $("#resource-group-select-entry").val()); }, 100);
+        }
+        getResourceGroups(0, $('#terminal-storage-creation-subscriptions').val());
+      });
+      $("#virtual-network-select-entry").on("change", function () {
+        displayNetworkProfiles();
+        displayRelayNamespaces();
+      });
+    }
+    else {
+      if (!inputError) {
+        $('#terminal-storage-creation-intro').show(1000);
+        $(".message-storage-subscriptions-choice.row").animate({ 'padding-top': '10px' }, 1000);
+      }
+      userLocation = assignedLocation;
+      $("#show-advanced").show();
+      $("#hide-advanced").hide();
+      $("#advanced-link").css("padding-top", "34px");
+      $("#show-vnet-settings").hide();
+      $("#location-selection-prompt").hide(1000);
+      $("#subscription-selection-prompt").animate({ 'margin-left': '238px' }, 1000);
+      $('#advanced-options').hide(1000);
+      $('.option-buttons').off('change');
+      $("#storage-account-buttons").off('change');
+      $("#resource-group-buttons").off('change');
+      $("#terminal-storage-creation-create").prop("disabled", false);
+    }
+    $("#terminal-storage-creation-subscriptions").focus();
+    $("#terminal-storage-creation-create").text($("#terminal-storage-creation-create").attr("create-storage"));
+  }
+
+  function populateSubscriptions() {
+    var selection = $('#terminal-storage-creation-subscriptions');
+    subscriptions.sort(function (a, b) {
+      var nameA = a.displayName.toUpperCase();
+      var nameB = b.displayName.toUpperCase();
+
+      return nameA < nameB ? -1 : (nameA > nameB ? 1 : 0);
+    });
+
+    var options = subscriptions;
+    for (var i = 0; i < options.length; i++) {
+      if ((i + 1 < options.length && options[i].displayName === options[i + 1].displayName)
+        || (i > 0 && options[i].displayName === options[i - 1].displayName)) {
+        options[i].optionName = options[i].displayName + ' (' + options[i].subscriptionId + ')';
+      }
+      else {
+        options[i].optionName = options[i].displayName;
+      }
+    }
+
+    $(selection).find('option').remove();
+    $.each(options, function (i, item) {
+      $(selection).append($('<option>', {
+        value: item.subscriptionId,
+        text: item.optionName
+      }));
+    });
+
+    // if user subscription provided prior to opening, set the dropdown's value to that for quicker interaction 
+    if(userSubscription != "") {
+      $(selection).val(userSubscription);
+    }
+    selection.trigger("change");
+  }
+
+  function populateResourceGroups(resourceGroups, subscriptionId) {
+    var rgNames = [];
+    var selection = $("#resource-group-select-entry");
+    selection.prop("disabled", false);
+    var options = resourceGroups;
+    for (var i = 0; i < options.length; i++) {
+      rgNames.push(options[i].name);
+    }
+    validResourceGroups[subscriptionId] = rgNames;
+    $(selection).find('option').remove();
+    var tooltipMessage = $("#resource-group-buttons").attr("tooltip");
+    if (usingVnetOptions()) {
+      if (options.length === 0) {
+        displayDisabledDropdown(selection);
+        displayDisabledDropdown($("#storage-account-select-entry"));
+        displayDisabledDropdown($("#virtual-network-select-entry"));
+        displayDisabledDropdown($("#network-profile-select-entry"));
+        displayDisabledDropdown($("#relay-namespace-select-entry"));
+      }
+      else {
+        populateDropdown(options, selection);
+        selection.trigger("change");
+      }
+    }
+    else {
+      if (options.length === 0) {
+        disableExisting($("#use-existing-rg"), $("#resource-group-buttons"), tooltipMessage);
+        $("#create-new-rg").prop("checked", true);
+        updateResourceGroupButtons();
+      }
+      else {
+        enableExisting($("#use-existing-rg"), $("#resource-group-buttons"));
+        populateDropdown(options, selection);
+        selection.trigger("change");
+      }
+    }
+  }
+
+  function populateStorageAccounts(storageAccounts) {
+    var selection = $("#storage-account-select-entry");
+    selection.prop("disabled", false);
+    $(selection).find('option').remove();
+    var options = storageAccounts.value;
+    var tooltipMessage = $("#storage-account-buttons").attr("tooltip2");
+    if (usingVnetOptions()) {
+      $("#create-new-sa").prop("checked", false);
+      options = options.filter(function (s) {
+        return s.properties.networkAcls.virtualNetworkRules.length > 0;
+      });
+      if (options.length === 0) {
+        displayDisabledDropdown(selection);
+      }
+      else {
+        populateStorageAccountDropdown(options, selection);
+      }
+    }
+    else {
+      options = options.filter(function (s) {
+        return s.location === userLocation;
+      });
+      if (options.length === 0) {
+        disableExisting($("#use-existing-sa"), $("#storage-account-buttons"), tooltipMessage);
+        $("#create-new-sa").prop("checked", true);
+        updateStorageAccountButtons();
+
+      }
+      else {
+        enableExisting($("#use-existing-sa"), $("#storage-account-buttons"));
+        populateStorageAccountDropdown(options, selection);
+      }
+    }
+  }
+
+  function populateVirtualNetworks(vnets) {
+    var selection = $("#virtual-network-select-entry");
+    $(selection).find('option').remove();
+    $(selection).prop("disabled", false);
+    var options = vnets.value;
+    options = options.filter(function (s) {
+      return s.location === $("#terminal-storage-select-location").val();
+    });
+    options.sort(function (a, b) {
+      return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+    });
+    if (options.length === 0) {
+      displayDisabledDropdown(selection);
+      displayDisabledDropdown($("#network-profile-select-entry"));
+      displayDisabledDropdown($("#relay-namespace-select-entry"));
+    }
+    else {
+      $.each(options, function (i, item) {
+        $(selection).append($('<option>', {
+          value: item.id,
+          text: item.name,
+          location: item.location
+        }));
+      });
+      selection.trigger("change");
+    }
+  }
+
+  function displayDisabledDropdown(selection) {
+    $(selection).find('option').remove();
+    $(selection).prop("disabled", true);
+    var message = $(selection).attr("disabled-message");
+    $(selection).append($('<option>', {
+      value: "",
+      text: message
+    }));
+  }
+
+  function populateNetworkProfiles(networkProfiles) {
+    var selection = $("#network-profile-select-entry");
+    $(selection).prop("disabled", false);
+    var options = networkProfiles.value;
+    options = options.filter(function (s) {
+      return JSON.stringify(s.properties.containerNetworkInterfaceConfigurations).toLowerCase().indexOf($("#virtual-network-select-entry").val().toLowerCase()) != -1;
+    });
+    options.sort(function (a, b) {
+      return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+    });
+    $(selection).find('option').remove();
+    if (options.length === 0) {
+      displayDisabledDropdown(selection);
+    }
+    else {
+      $.each(options, function (i, item) {
+        $(selection).append($('<option>', {
+          value: item.id,
+          text: item.name
+        }));
+      });
+      selection.trigger("change");
+    }
+  }
+
+  function populateRelayNamespaces(relayNamespaces) {
+    var selection = $("#relay-namespace-select-entry");
+    $(selection).find('option').remove();
+    $(selection).prop("disabled", false);
+    var options = relayNamespaces.value;
+    options.sort(function (a, b) {
+      return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0);
+    });
+    if (options.length === 0) {
+      displayDisabledDropdown(selection);
+    }
+    else {
+      $.each(options, function (i, item) {
+        $(selection).append($('<option>', {
+          value: item.id,
+          text: item.name
+        }));
+      });
+      selection.trigger("change");
+    }
+  }
+
+  function handleQuit(evt) {
+    $(evt.target).closest(".terminal-dialog").hide();
+    postMessageHelper("close");
+  }
+
+  function resetCreateStorageDialog() {
+    $('#terminal-storage-creation-subscriptions').prop("disabled", false);
+
+    $("#terminal-storage-creation-create").prop("disabled", false);
+    $("#terminal-storage-creation-create").text($("#terminal-storage-creation-create").attr("create-storage"));
+  }
+
+  function handleCreateStorage(evt) {
+    $("#terminal-storage-creation-create").prop("disabled", true);
+    $("#terminal-storage-creation-create").text($("#terminal-storage-creation-create").attr("creating"));
+    $('#terminal-storage-creation-subscriptions').prop("disabled", true);
+
+    var sid = $('#terminal-storage-creation-subscriptions').val();
+    storage.subscriptionId = sid;
+    createResourceGroup(sid);
+  }
+
+  $("#terminal-storage-creation-create").off("keypress click keydown");
+  $(".terminal-dialog-quit").off('keypress click keydown');
+
+  enterClickHandler($("#terminal-storage-creation-create"), function () {
+    showAdvancedSettings = !($("#advanced-options").css("display") === "none");
+    handleCreateStorage();
+  });
+
+  arrowKeyHandler($("#terminal-storage-creation-create"), "right", function () {
+    $("#terminal-storage-creation-close").focus();
+  });
+
+  arrowKeyHandler($("#terminal-storage-creation-close"), "left", function () {
+    $("#terminal-storage-creation-create").focus();
+  });
+
+  enterClickHandler($(".terminal-dialog-quit"), function (e) {
+    handleQuit(e);
+  });
+
+  resetCreateStorageDialog();
+
+  function storageCreationFailed(status, error) {
+    resetCreateStorageDialog();
+    inputError = true;
+    $('#terminal-storage-creation-intro').hide();
+    $('#terminal-storage-creation').hide();
+    $('#standard-header').hide();
+    $("#time-out-body").html(format($("#time-out-body").html(), terminalIdleTimeout));
+    $("#creation-failure-error-code").html(format($("#creation-failure-error-code").html(), status));
+    $("#creation-failure-error-message").text(error);
+    $('.message-storage-subscriptions-choice').show();
+    $('#error-header').show();
+    $('#terminal-storage-creation').show();
+    $('#terminal-storage-creation-subscriptions').focus();
+    $(".message-storage-subscriptions-choice.row").css({ 'padding-top': '0px' });
+    $('#terminal-dialog-rg_storage-creation-failure').show();
+    $('#terminal-storage-creation-footer').hide();
+    $("#terminal-storage-creation").show();
+    $("#terminal-storage-creation-content")[0].scrollTop = 0;
+  }
+
+  function getProviderRegistrationState(retries, sid, fnCreateStorageAccount, resourceProviderNamespace) {
+    var method = 'GET';
+    var targetUri = getARMEndpoint() + '/subscriptions/' + sid + '/providers/' + resourceProviderNamespace + '?api-version=' + armApiVersion;
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.RESOURCEPROVIDER.GET', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+        if (retries === 8) {
+          storageCreationFailed(jqXHR.status, jqXHR.responseText);
+        }
+        else {
+          window.setTimeout(function () { getProviderRegistrationState(retries + 1, sid, fnCreateStorageAccount, resourceProviderNamespace) }, 3000);
+        }
+      })
+      .done(function (data, textStatus, jqXHR) {
+        if (data.registrationState === "Registered" || retries === 8) {
+          fnCreateStorageAccount();
+        }
+        else {
+          window.setTimeout(function () { getProviderRegistrationState(retries + 1, sid, fnCreateStorageAccount, resourceProviderNamespace) }, 3000);
+        }
+      });
+  }
+
+  function registerStorageResourceProvider(sid, fnCreateStorageAccount) {
+    var method = 'POST';
+    var resourceProviderNamespace = 'Microsoft.Storage'
+    var targetUri = getARMEndpoint() + '/subscriptions/' + sid + '/providers/' + resourceProviderNamespace + '/register?api-version=' + armApiVersion;
+    var start = Date.now();
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.RESOURCEPROVIDER.REGISTER', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+        storageCreationFailed(jqXHR.status, jqXHR.responseText);
+      })
+      .done(function (data, textStatus, jqXHR) {
+        window.setTimeout(function () { getProviderRegistrationState(0, sid, fnCreateStorageAccount, resourceProviderNamespace) }, 3000);
+      });
+  }
+
+  function createResourceGroup(sid) {
+    var method = 'PUT';
+    var resourceGroupName;
+    if (!showAdvancedSettings) {
+      resourceGroupName = cloudShellStorageString + '-' + userLocation;
+    }
+    else if (usingVnetOptions()) {
+      resourceGroupName = $("#resource-group-select-entry").val();
+    }
+    else {
+      if ($("#create-new-rg").prop('checked')) {
+        resourceGroupName = $("#resource-group-text-entry").val();
+      }
+      else {
+        resourceGroupName = $("#resource-group-select-entry").val();
+      }
+    }
+    storage.resourceGroupName = resourceGroupName;
+    var targetUri = getARMEndpoint() + '/subscriptions/' + sid + '/resourcegroups/' + resourceGroupName + '?api-version=' + armApiVersion;
+    var start = Date.now();
+    var locationObject = { location: userLocation };
+    $.ajax(targetUri,
+      {
+        method: "GET",
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        if (jqXHR.status === 404 && jqXHR.responseJSON && jqXHR.responseJSON.error && jqXHR.responseJSON.error.code === 'ResourceGroupNotFound') {
+          $.ajax(targetUri,
+            {
+              method: method,
+              headers: {
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Authorization': accessToken,
+                'Accept-Language': language
+              },
+              data: JSON.stringify(locationObject)
+            })
+            .fail(function (jqXHR, textStatus, errorThrown) {
+              logger.clientRequest('ACC.RESOURCEGROUP.CREATE', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+              storageCreationFailed(jqXHR.status, jqXHR.responseText);
+            })
+            .done(function (data, textStatus, jqXHR) {
+              createStorageAccount(sid, resourceGroupName);
+            });
+        }
+        else {
+          logger.clientRequest('ACC.RESOURCEGROUP.GET', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+          storageCreationFailed(jqXHR.status, jqXHR.responseText);
+        }
+      })
+      .done(function (data, textStatus, jqXHR) {
+        createStorageAccount(sid, resourceGroupName);
+      });
+  }
+
+  function createStorageAccount(sid, resourceGroupName) {
+    var method = 'PUT';
+    //storage account name restriction: 3-24 characters and must be lowercase alphanumeric
+    var accountName;
+    if (!showAdvancedSettings) {
+      accountName = "cs" + userLocationCode;
+      var len = 24 - accountName.length;
+      accountName += puid.substring(0, len);
+      accountName = accountName.toLowerCase().replace(/[^a-z|0-9]/g, 'x');
+    }
+    else {
+      if (usingVnetOptions()) {
+        accountName = $("#storage-account-select-entry").val().split("-")[0];
+        storageType = $("#storage-account-select-entry").val().split("-")[1];
+      }
+      else {
+        if ($("#create-new-sa").prop('checked')) {
+          accountName = $("#storage-account-text-entry").val();
+          storageType = "Standard";
+        }
+        else {
+          accountName = $("#storage-account-select-entry").val().split("-")[0];
+          storageType = $("#storage-account-select-entry").val().split("-")[1];
+        }
+      }
+    }
+
+    storage.storageAccountName = accountName;
+    storageAccountResourceId = '/subscriptions/' + sid + '/resourcegroups/' + resourceGroupName + '/providers/Microsoft.Storage/storageAccounts/' + accountName;
+    var targetUri = getARMEndpoint() + storageAccountResourceId + '?api-version=' + storageApiVersion;
+    var start = Date.now();
+    var data = {
+      location: userLocation,
+      sku: { name: 'Standard_LRS' },
+      kind: 'StorageV2',
+      tags: { 'ms-resource-usage': 'azure-cloud-shell' },
+      properties: {
+        encryption: {
+          services: {
+            blob: { 'enabled': true },
+            file: { 'enabled': true }
+          },
+          keySource: 'Microsoft.Storage'
+        },
+        supportsHttpsTrafficOnly: true,
+        allowBlobPublicAccess: false,
+        minimumTlsVersion: "TLS1_2"
+      }
+    };
+    //USNat and USSec doesn't support minimum TLS version, remove it
+    if (isSecureCloud()) {
+      delete data.properties.minimumTlsVersion;
+    }
+
+    var headers = {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'Authorization': accessToken,
+      'Accept-Language': language
+    };
+
+    $.ajax(targetUri,
+      {
+        method: "GET",
+        headers: headers
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        if (jqXHR.status === 404 && jqXHR.responseJSON && jqXHR.responseJSON.error && jqXHR.responseJSON.error.code === 'ResourceNotFound') {
+          $.ajax(targetUri,
+            {
+              method: method,
+              headers: headers,
+              data: JSON.stringify(data)
+            })
+            .fail(function (jqXHR, textStatus, errorThrown) {
+              logger.clientRequest('ACC.STORAGEACCOUNT.CREATE', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+
+              if (jqXHR.status === 202) {
+                window.setTimeout(function () { getStorageAccount(0); }, 3000);
+              }
+              else if (jqXHR.status === 409 && jqXHR.responseJSON && jqXHR.responseJSON.error && jqXHR.responseJSON.error.code === 'MissingSubscriptionRegistration') {
+                registerStorageResourceProvider(sid, function () {
+                  createStorageAccount(sid, resourceGroupName);
+                });
+              }
+              else {
+                storageCreationFailed(jqXHR.status, jqXHR.responseText);
+              }
+            })
+            .done(function (data, textStatus, jqXHR) {
+              if (jqXHR.status === 202) {
+                window.setTimeout(function () { getStorageAccount(0); }, 3000);
+              }
+              else {
+                createUserSettings();
+              }
+            });
+        }
+        else {
+          logger.clientRequest('ACC.STORAGEACCOUNT.GET', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+          storageCreationFailed(jqXHR.status, jqXHR.responseText);
+        }
+      })
+      .done(function (data, textStatus, jqXHR) {
+        if (data.kind === 'BlobStorage') {
+          storageCreationFailed($("#terminal-dialog-rg_storage-creation-failure-reason").attr("failed"), $("#creation-failure-error-message").attr("blob-error"));
+        }
+        else {
+          if (data.tags["ms-resource-usage"] !== 'azure-cloud-shell') {
+            data.tags["ms-resource-usage"] = 'azure-cloud-shell';
+            data = {
+              tags: data.tags
+            }
+            $.ajax(targetUri,
+              {
+                method: 'PATCH',
+                headers: headers,
+                data: JSON.stringify(data)
+              })
+              .fail(function (jqXHR, textStatus, errorThrown) {
+                console.error('Error updating storage account tags: ' + errorThrown);
+              })
+              .always(function () {
+                createUserSettings();
+              });
+          }
+          else {
+            createUserSettings();
+          }
+        }
+      });
+  }
+
+  function getStorageAccount(retriesForGetStorageAccount, startTime) {
+    var targetUri = getARMEndpoint() + storageAccountResourceId + '?api-version=' + storageApiVersion;
+    var method = 'GET';
+
+    startTime = startTime || Date.now();
+
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        },
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        window.setTimeout(function () { getStorageAccount(retriesForGetStorageAccount + 1, startTime) }, 3000);
+      })
+      .done(function (data, textStatus, jqXHR) {
+        if (data.properties.provisioningState === "Succeeded") {
+          createUserSettings();
+        }
+        else if (data.properties.provisioningState === "Failed") {
+          logger.clientTelemetry('ACC.STORAGEACCOUNT.PUT.FAILURE', { storageAccount: storageAccountResourceId, provisioningState: data.properties.provisioningState }, { retryCount: retriesForGetStorageAccount }, Date.now() - startTime);
+          storageCreationFailed($("#terminal-dialog-rg_storage-creation-failure-reason").attr("failed"), format($("#creation-failure-error-message").attr("failed"), storageAccountResourceId));
+        }
+        else {
+          if (retriesForGetStorageAccount >= retryLimitForGetStorageAccount) {
+            $("#terminal-storage-creation").hide();
+
+            logger.clientTelemetry('ACC.STORAGEACCOUNT.PUT.TIMEOUT', { storageAccount: storageAccountResourceId, provisioningState: data.properties.provisioningState }, { retryCount: retriesForGetStorageAccount }, Date.now() - startTime);
+            resetCreateStorageDialog();
+          }
+          else {
+            window.setTimeout(function () { getStorageAccount(retriesForGetStorageAccount + 1, startTime) }, 3000);
+          }
+        }
+      });
+  }
+
+  function buildStorageFileShareName() {
+    var claims = jwt_decode(accessToken);
+    var userName = getUserNameFromClaims(claims);
+    var prefix = ('cs-' + userName + '-').toLowerCase().replace(/[^a-z|0-9|-]/g, '-').replace(/-+/g, '-');
+    var fileShareName = prefix + puid;
+    //note if fileShareName is too long, we trucate one extra char from prefix and then add back the dash to preserve the dash
+    return fileShareName.length <= 63 ? fileShareName : (prefix.substring(0, 62 - puid.length) + '-' + puid).replace(/-+/g, '-');
+  }
+
+  function createUserSettings() {
+    var fileShareName = !showAdvancedSettings ? buildStorageFileShareName() : $("#file-share-entry").val();
+    var diskSize = storageType === "Premium" ? 100 : 5;
+    var location = storageLocationMapping[userLocation];
+    var providerLocation = getAzureConsoleProviderLocation();
+    if (providerLocation === "centralus") {
+      location = "centraluseuap";
+    }
+    if (providerLocation === "eastus2") {
+      location = "eastus2euap";
+    }
+    var networkType = usingVnetOptions() ? NetworkType.Isolated : NetworkType.Default;
+    var vnetSettings = {}
+    networkTypeSelection = networkType;
+
+    var data = {
+      properties: {
+        preferredOsType: osTypeSelection,
+        preferredShellType: shellTypeSelection,
+        preferredLocation: location,
+        networkType: networkType,
+        sessionType: SessionType.Mounted,
+        userSubscription: $('#terminal-storage-creation-subscriptions').val(),
+      }
+    };
+    var storage = {
+      storageAccountResourceId: storageAccountResourceId,
+      fileShareName: fileShareName,
+      diskSizeInGB: diskSize
+    }
+
+    if (networkType === NetworkType.Isolated) {
+      vnetSettings.networkProfileResourceId = $("#network-profile-select-entry").val();
+      vnetSettings.relayNamespaceResourceId = $("#relay-namespace-select-entry").val();
+      vnetSettings.isolatedStorageProfile = storage;
+      vnetSettings.location = $("#virtual-network-select-entry").find('option:selected').attr("location");
+      virtualNetwork = $("#virtual-network-select-entry").find('option:selected').text();
+      addToLocalStorage('virtualNetwork', virtualNetwork);
+      data.properties.vnetSettings = vnetSettings;
+      data.properties.storageProfile = storage; // TODO: fix bug that is not allowing storageProfile to be null
+    }
+    else {
+      addToLocalStorage('virtualNetwork', "");
+      data.properties.storageProfile = storage;
+    }
+
+    userSettings = data.properties;
+    if (popout) {
+      displayUserSettings();
+    }
+    updateFileServiceLink();
+
+    var userSettingsSubscriptionId = getUserSettingsSubscriptionId(userSettings);
+
+    if (userSettingsSubscriptionId != null) {
+      verifyCloudShellProviderRegistration(userSettingsSubscriptionId)
+    }
+
+    putUserSettings(data, function (jqXHR, textStatus, errorThrown) {
+      $("#terminal-storage-creation").hide();
+      storageCreationFailed(jqXHR.status, jqXHR.responseText);
+      resetCreateStorageDialog();
+    }, function (data, textStatus, jqXHR) {
+      $("#terminal-storage-creation").hide();
+      resetCreateStorageDialog();
+      if (data.properties.storageProfile) {
+        callback(shellTypeSelection);
+      }
+    });
+  }
+}
+
+function getStorageProfile(userSettings) {
+  return userSettings.networkType === NetworkType.Isolated ? userSettings.vnetSettings.isolatedStorageProfile : userSettings.storageProfile;
+}
+
+function getUserSettingsSubscriptionId(userSettings) {
+  var subscriptionId;
+  var storageProfile = getStorageProfile(userSettings);
+  var storageSubscriptionId = getSubscriptionId(storageProfile);
+  switch (userSettings.sessionType) {
+    case SessionType.Ephemeral:
+      subscriptionId = userSettings.userSubscription.trim();
+      break;
+    case SessionType.Mounted:
+      subscriptionId = userSettings.userSubscription.trim().length != 0 ? userSettings.userSubscription.trim() : storageSubscriptionId;
+      break;
+    default:
+      subscriptionId = storageSubscriptionId;
+  }
+
+  if (subscriptionId === null) {
+    logger.clientTelemetry('ACC.SUBSCRIPTIONREGISTRATION.INVALID', { "sessionType": userSettings.sessionType, "storageProfile": storageProfile }, {}, 0);
+    console.log("SessionType: '" + userSettings.sessionType + "'Either StorageProfile subscription or UserSubscription: Null.")
+  }
+
+  return subscriptionId;
+}
+
+function getSubscriptionId(storageProfile) {
+  var subscriptionId;
+  if (storageProfile != null) {
+    var storageAccountResource = storageProfile.storageAccountResourceId.split("/");
+    var storageAccountIds = storageProfile.storageAccountResourceId.split("/");
+    subscriptionId = storageAccountIds[storageAccountResource.indexOf("subscriptions") + 1];
+  }
+  else {
+    console.log("storageProfile Null, SubscriptionId will be Null too.")
+    subscriptionId = null;
+  }
+
+  return subscriptionId;
+}
+
+function displayUserSettings() {
+  var storageProfile = getStorageProfile(userSettings);
+  var subscriptionId = getSubscriptionId(storageProfile);
+  var storageAccountId = storageAccountIds[storageAccountIds.indexOf("storageAccounts") + 1];
+  var armUri = getARMEndpoint() + '/subscriptions/' + subscriptionId + '?api-version=' + armApiVersion;
+  $("#cloudshell-header").show();
+  $.ajax(armUri,
+    {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': accessToken
+      },
+    })
+    .fail(function (jqXHR, textStatus, errorThrown) {
+      $("#subscription-name").text(subscriptionId);
+    })
+    .done(function (data, textStatus, jqXHR) {
+      $("#subscription-name").text(data.displayName);
+    });
+
+  $("#storage-account-name").text(storageAccountId);
+}
+
+function putUserSettings(data, callbackFail, callbackDone) {
+  var method = 'PUT';
+  var targetUri = getARMEndpoint() + '/providers/Microsoft.Portal' + getAzureConsoleProviderLocation() + '/userSettings/cloudconsole?api-version=' + consoleApiVersion;
+  var start = Date.now();
+  $.ajax(targetUri,
+    {
+      method: method,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language,
+      },
+      data: JSON.stringify(data)
+    })
+    .fail(function (jqXHR, textStatus, errorThrown) {
+      callbackFail(jqXHR, textStatus, errorThrown);
+    })
+    .done(function (data, textStatus, jqXHR) {
+      callbackDone(data, textStatus, jqXHR);
+    });
+}
+
+function loadUserSettings(callbackFail, callbackDone, callbackAlways, correlationId = null) {
+  var method = 'GET';
+  var targetUri = getARMEndpoint() + '/providers/Microsoft.Portal' + getAzureConsoleProviderLocation() + '/userSettings/cloudconsole?api-version=' + consoleApiVersion;
+  var start = Date.now();
+  $.ajax(targetUri,
+    {
+      method: method,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language,
+        'x-ms-correlation-request-id': correlationId == null ? guid() : correlationId,
+      },
+    })
+    .fail(function (jqXHR, textStatus, errorThrown, start, targetUri) {
+      callbackFail(jqXHR, textStatus, errorThrown, start, targetUri);
+    })
+    .done(function (data, textStatus, jqXHR) {
+      callbackDone(data, textStatus, jqXHR);
+    })
+    .always(function () {
+      callbackAlways();
+    });
+}
+
+function forceResetUserSettings(callbackFail, callbackDone) {
+  var method = 'DELETE';
+  var targetUri = getARMEndpoint() + '/providers/Microsoft.Portal' + getAzureConsoleProviderLocation() + '/userSettings/cloudconsole?api-version=' + consoleApiVersion;
+  var start = Date.now();
+  $.ajax(targetUri,
+    {
+      method: method,
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language
+      },
+    })
+    .fail(function (jqXHR, textStatus, errorThrown, start, targetUri) {
+      callbackFail(jqXHR, textStatus, errorThrown, start, targetUri);
+    })
+    .done(function (data, textStatus, jqXHR) {
+      callbackDone(data, textStatus, jqXHR);
+    });
+}
+
+
+function createTerminal() {
+  while (terminalContainer.children.length) {
+    terminalContainer.removeChild(terminalContainer.children[0]);
+  }
+
+  term = new Terminal({
+    cursorBlink: true
+  });
+
+  term.onResize(function (size) {
+    if (!termId) {
+      return;
+    }
+
+    var method = 'POST';
+    var targetUri = consoleUri + '/terminals/' + termId + '/size?cols=' + size.cols + '&rows=' + size.rows + '&version=2019-01-01';
+    var start = Date.now();
+
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        },
+        data: JSON.stringify({})
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.TERMINAL.RESIZE', {}, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+      })
+      .done(function (data, textStatus, jqXHR) {
+        logger.clientRequest('ACC.TERMINAL.RESIZE', {}, Date.now() - start, method, "", null, null, null, null, jqXHR.status);
+      });
+  });
+  screenReaderMode = getFromLocalStorage('screenReaderMode') || "off";
+  term.open(terminalContainer);
+  term.focus();
+  term.loadAddon(fitAddon);
+  fitAddon.fit();
+  term.setOption('screenReaderMode', false);
+  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.connectionState = ConnectionState.NotConnected;
+
+  if (screenReaderMode === "on") {
+    term.setOption('screenReaderMode', true);
+    $("#terminal-container").attr('aria-label', $("#terminal-container").attr('screen-reader-on-message'));
+  }
+
+  term.attachCustomKeyEventHandler(function (e) {
+    // On Shift+Tab set focus to parent so keyboard-only users can navigate in and out of terminal
+    var keyCode = e.keyCode || e.which;
+    if (keyCode == 9) {
+      if (e.shiftKey) {
+        $("#terminal-container").focus();
+        return false;
+      }
+    }
+    if (e.ctrlKey || e.metaKey) {
+      // On CTRL+C copy if there is an active selection, otherwise let xterm handle the command
+      if (keyCode == 67) {
+        if (term.hasSelection()) {
+          document.execCommand('copy');
+          setTimeout(function () { term.clearSelection() }, 20);
+          return false;
+        }
+        return true;
+      }
+      // TODO (rosturm): support CTRL+V for pasting
+      if (keyCode == 192) {
+        if (isEditorOpen()) {
+          editor.focus();
+          return false;
+        }
+        return false;
+      }
+    }
+  });
+  // Workaround to fix autocomplete on mobile device.
+  $('.xterm-helper-textarea').attr('autocomplete', 'off');
+
+  // Hard code bright black and red color
+  term.setOption('theme', { brightBlack: '#b8bcb8' });
+  term.setOption('theme', { red: '#ff5252' });
+
+  provisionConsole();
+}
+
+function keepAlive() {
+  var start = Date.now();
+  var method = 'POST';
+  var targetUri = consoleUri + '/keepAlive';
+
+  $.ajax(targetUri,
+    {
+      method: method,
+      contentType: 'application/json',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language
+      },
+      data: JSON.stringify({})
+    })
+    .fail(function (jqXHR, textStatus, errorThrown) {
+      logger.clientRequest('ACC.KEEPALIVE', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+    })
+    .done(function (data, textStatus, jqXHR) {
+      logger.clientRequest('ACC.KEEPALIVE', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+    });
+
+  logger.clientTelemetry('ACC.HEARTBEAT', {}, {}, Date.now() - term.connectTime.getTime());
+}
+
+function authorizeSession() {
+  var start = Date.now();
+  var targetUri = consoleUri + "/authorize";
+  var method = "POST";
+  $.ajax(targetUri,
+    {
+      method: method,
+      contentType: 'application/json',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language
+      },
+      data: JSON.stringify({})
+    })
+    .fail(function (jqXHR, textStatus, errorThrown) {
+      logger.clientRequest('ACC.AUTHORIZE', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+    })
+    .done(function (data, textStatus, jqXHR) {
+      var cookieToken = data.token;
+      var a = document.createElement("img");
+      a.src = targetUri + "?token=" + encodeURIComponent(cookieToken);
+      logger.clientRequest('ACC.AUTHORIZE', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+    });
+}
+
+function fetchVnetInfo(storageAccountResourceId) {
+  var target = storageAccountResourceId.replace('Microsoft.Storage', 'Microsoft.Network').replace('storageAccounts', 'networkProfiles');
+  var targetUri = getARMEndpoint() + target.substring(0, target.lastIndexOf('/')) + '?api-version=' + armApiVersion;
+  $.ajax(targetUri,
+    {
+      method: "GET",
+      contentType: 'application/json',
+      headers: {
+        'Accept': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language
+      }
+    })
+    .fail(function (jqXHR, textStatus, errorThrown) {
+
+    })
+    .done(function (data, textStatus, jqXHR) {
+      console.log(data);
+    });
+}
+
+function provisionConsole() {
+  var accFeatures = getQueryParametersPrefix('feature.azureconsole.').reduce(function (acc, val) {
+    return acc + '&' + val.name + '=' + val.value;
+  }, "");
+
+  var targetUri = getConsoleUri() + accFeatures;
+  var start = Date.now();
+  var correlationId = guid();
+
+  function provisionConsoleInternal(correlationId, pollingTimeout) {
+    start = pollingTimeout ? start : Date.now();
+    var initialText = "Requesting a Cloud Shell.";
+    if (networkTypeSelection === NetworkType.Isolated) {
+      virtualNetwork = virtualNetwork || getFromLocalStorage('virtualNetwork');
+      initialText = "Requesting a Cloud Shell in virtual network" + (virtualNetwork ? (" '" + virtualNetwork + "'") : "") + ". " + "This may take several minutes.";
+    }
+    term.write(pollingTimeout ? "." : initialText);
+    var method = pollingTimeout ? 'GET' : 'PUT';
+    var data = {
+      properties: {
+        osType: osTypeSelection
+      }
+    };
+
+    var startInternal = Date.now();
+
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'x-ms-console-preferred-location': storage.location,
+          'x-ms-correlation-request-id': correlationId == null ? guid() : correlationId,
+          'Accept-Language': language
+        },
+        data: (pollingTimeout ? undefined : JSON.stringify(data))
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.CONSOLE.' + method, {}, Date.now() - startInternal, method, targetUri, consoleApiVersion, null, jqXHR.getResponseHeader('x-ms-request-id'), null, jqXHR.status, correlationId);
+
+        if (method === 'PUT' && jqXHR.status === 409 && jqXHR.responseJSON && jqXHR.responseJSON.error && jqXHR.responseJSON.error.code === 'DeploymentOsTypeConflict') {
+          // If the requesting Shell type is different from existing console Shell type, need to switch over.
+          showSwitchShellTypeConfirmation(userSettings.preferredShellType);
+          return;
+        }
+
+        if (jqXHR.responseJSON && jqXHR.responseJSON.error) {
+          term.writeln("\x1B[1;31mFailed to provision a Cloud Shell: " + JSON.stringify(jqXHR.responseJSON.error) + "\x1B[0m ");
+        }
+        else {
+          term.writeln("\x1B[1;31mFailed to provision a Cloud Shell.\x1B[0m ");
+        }
+        logger.clientTelemetry('ACC.CONSOLE.' + method + '.FAILURE', {}, {}, Date.now() - start, correlationId);
+      })
+      .done(function (consoleResource, textStatus, jqXHR) {
+        if (consoleResource.properties.provisioningState === "Succeeded") {
+          logger.clientTelemetry('ACC.CONSOLE.PUT.SUCCESS', {}, {}, Date.now() - start, correlationId);
+
+          term.writeln("\x1B[1;32mSucceeded.\x1B[0m ");
+          term.writeln('Connecting terminal...\n\r');
+
+          connectTerminal(consoleResource, shellTypeSelection, correlationId);
+          authorizeSession();
+        }
+        else if (consoleResource.properties.provisioningState === "Failed") {
+          term.connectionState = ConnectionState.NotConnected;
+          logger.clientTelemetry('ACC.CONSOLE.PUT.FAILURE', {}, {}, Date.now() - start, correlationId);
+          term.writeln("\x1B[1;31mSorry, your Cloud Shell failed to provision. Please retry later. Request correlation id: " + jqXHR.getResponseHeader('x-ms-routing-request-id') + "\x1B[0m ");
+        }
+        else {
+          var minutesToWait = networkTypeSelection === NetworkType.Isolated ? 10 : 5;
+          pollingTimeout = pollingTimeout || new Date(Date.now() + minutesToWait * 60 * 1000);
+          if (pollingTimeout > new Date()) {
+            setTimeout(function () { provisionConsoleInternal(correlationId, pollingTimeout) }, 1000);
+          }
+          else {
+            term.connectionState = ConnectionState.NotConnected;
+            logger.clientTelemetry('ACC.CONSOLE.PUT.TIMEOUT', {}, {}, Date.now() - start, correlationId);
+            term.writeln("\n\r\x1B[1;31mSorry, your Cloud Shell failed to provision. Please retry later. Request correlation id: " + jqXHR.getResponseHeader('x-ms-routing-request-id') + "\x1B[0m ");
+          }
+        }
+      });
+  }
+
+  term.connectionState = ConnectionState.Connecting;
+
+  checkUserSettings(function () {
+    showTerminal();
+
+    if (storage.fileShareName) {
+      term.writeln("Your cloud drive has been created in:")
+      term.writeln("");
+      term.writeln("Subscription Id: " + storage.subscriptionId);
+      term.writeln("Resource group:  " + storage.resourceGroupName);
+      term.writeln("Storage account: " + storage.storageAccountName);
+      term.writeln("File share:      " + storage.fileShareName);
+      term.writeln("");
+      term.write("Initializing your account for Cloud Shell... ");
+
+      waitingCursor(
+        function (setTimeout) { setTimeout(1000 * 10); },
+        function () { term.writeln(""); provisionConsoleInternal(correlationId); });
+    }
+    else {
+      provisionConsoleInternal(correlationId);
+    }
+  }, correlationId);
+}
+
+function connectTerminal(consoleResource, shellType, correlationId, retryCount) {
+  var start = Date.now();
+
+  function connectTerminalInternal(consoleResource, correlationId, retryCount) {
+    consoleUri = consoleResource.properties.uri;
+
+    var method = 'POST';
+    var targetUri = consoleUri + '/terminals?cols=' + term.cols + '&rows=' + term.rows + '&version=2019-01-01' + '&shell=' + shellType;
+    var startInternal = Date.now();
+    var requestId = guid();
+
+    retryCount = retryCount || 0;
+
+    $.ajax(targetUri,
+      {
+        method: method,
+        contentType: 'application/json',
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': accessToken,
+          'x-ms-client-request-id': requestId,
+          // 'x-ms-correlation-request-id': correlationId == null ? guid() : correlationId, // Will be asdded back after making agent code changes.
+          'Accept-Language': language
+        },
+        data: JSON.stringify({})
+      })
+      .then(function (res, textStatus, jqXHR) {
+        logger.clientRequest('ACC.TERMINAL.POST', { retryCount: retryCount }, Date.now() - startInternal, method, targetUri, null, requestId, null, null, jqXHR.status, correlationId);
+        logger.clientTelemetry('ACC.TERMINAL.CONNECT.SUCCESS', {}, { retryCount: retryCount }, Date.now() - start, correlationId);
+
+        termId = res.id;
+        userRootDirectory = res.rootDirectory;
+        terminalIdleTimeout = res.idleTimeout || terminalIdleTimeout;
+        terminalIdleTimeout = Number(terminalIdleTimeout);
+        var socketUri = res.socketUri;
+        socketUri = socketUri.replace(":443", "");
+
+        // uri examples
+        // targetUri            https://gateway03.centraluseuap.console.azure.com/n/cc-a3eab4b5/cc-a3eab4b5/terminals?cols=79&rows=30&version=2019-01-01&shell=bash
+        // res.socketUri.good   wss://gateway03.centraluseuap.console.azure.com/n/cc-a3eab4b5/cc-a3eab4b5/terminals/2c413dae1e42bd66fb4f15919521194a
+        // res.socketUri.bad    wss://localhost:3000//70b319b5fbc85cef8f46be71aab927d5
+        var targetUriBody = targetUri.replace('https://', '').split('?')[0];
+        if (socketUri.indexOf(targetUriBody) == -1) {
+          socketUri = 'wss://' + targetUriBody + '/' + termId;
+        }
+        if (targetUriBody.includes('servicebus')) {
+          targetUriBody = targetUriBody.split('/');
+          socketUri = 'wss://' + targetUriBody[0] + '/$hc/' + targetUriBody[1] + '/terminals/' + termId;
+        }
+
+        // connectSocket(res.socketUri, null, handleSocketOpen, handleTerminalSocketMessage, handleConnectionTimeout);
+        // connectSocket(res.socketUri + "/control", null, handleControlSocketOpen, handleControlSocketMessage, function() {});
+
+        connectSocket(socketUri, null, handleSocketOpen, handleTerminalSocketMessage, handleConnectionTimeout);
+        connectSocket(socketUri + "/control", null, handleControlSocketOpen, handleControlSocketMessage, function () { });
+        document.dispatchEvent(new CustomEvent('layoutUpdate'));
+        window.onresize = function () {
+          rtime = Date.now();
+          if (timeout === false) {
+            timeout = true;
+            setTimeout(resizeTerminal, delta);
+          }
+        }
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.TERMINAL.POST', { retryCount: retryCount }, Date.now() - startInternal, method, targetUri, null, requestId, null, null, jqXHR.status, correlationId);
+
+        if (jqXHR.status === 403 && jqXHR.responseJSON && jqXHR.responseJSON.error) {
+          if (jqXHR.responseJSON.error.code === 'SubscriptionNotEnabled') {
+            term.connectionState = ConnectionState.NotConnected;
+            hideTerminal();
+            $("#terminal-invalid-subscription-dialog").show();
+            return;
+          }
+        }
+
+        if (jqXHR.status === 400 && jqXHR.responseJSON && jqXHR.responseJSON.error) {
+          if (jqXHR.responseJSON.error.code === 'TooManyTerminals') {
+            term.connectionState = ConnectionState.NotConnected;
+            term.writeln("\x1B[1;31mFailed to request a terminal: " + jqXHR.responseJSON.error.message);
+            term.setOption('cursorBlink', false);
+            return;
+          }
+          else if (jqXHR.responseJSON.error.code === 'UserSettingsInvalid') {
+            restartTerminal(jqXHR.responseJSON.error.message);
+            return;
+          }
+        }
+
+        // The retry interval is set below to 1000 ms. We want to give the proxy and agent some time to come up, so we retry
+        // for up to 1000ms x 120 = 120 seconds = 2 minutes
+        if (retryCount > 120) {
+          term.connectionState = ConnectionState.NotConnected;
+          logger.clientTelemetry('ACC.TERMINAL.CONNECT.TIMEOUT', { status: jqXHR.status }, { retryCount: retryCount }, Date.now() - start, correlationId);
+
+          if (textStatus == "error" && networkTypeSelection === NetworkType.Isolated) {
+            term.connectionState = ConnectionState.NotConnected;
+            term.writeln("\x1B[1;31mFailed to connect to terminal. Please restart Cloud Shell.");
+            logger.clientTelemetry('ACC.TERMINAL.VNET.FAILURE', { status: jqXHR.status }, { retryCount: retryCount }, Date.now() - start, correlationId);
+            return;
+          }
+          else if (jqXHR.responseJSON && jqXHR.responseJSON.error) {
+            term.writeln("\x1B[1;31mFailed to request a terminal: " + JSON.stringify(jqXHR.responseJSON.error) + "\x1B[0m ");
+          }
+          else {
+            term.writeln("\x1B[1;31mFailed to request a terminal.\x1B[0m ");
+          }
+        }
+        else {
+          setTimeout(function () { connectTerminalInternal(consoleResource, correlationId, retryCount + 1) }, 1000)
+        }
+      });
+  }
+
+  connectTerminalInternal(consoleResource, correlationId);
+}
+
+function postMessageHelper(type, message) {
+  if (window.parent !== window) {
+    if (type === "maximize") {
+      logger.clientTelemetry('ACC.WINDOW.CONTROLS', { "action": "maximize" }, {}, 0);
+    }
+    message = $.extend(message, {
+      signature: "portalConsole",
+      type: type
+    });
+    window.parent.postMessage(message, trustedAuthority);
+  }
+}
+
+function getTokens() {
+  postMessageHelper("getToken", { audience: "" });
+}
+
+function getConfig() {
+  postMessageHelper("getConfig", { audience: "" });
+}
+
+function getCommands() {
+  postMessageHelper("getCommand", { audience: "" });
+}
+
+// Requests ARM endpoint.
+//postMessageHelper("getArmEndpoint");
+
+function reconnectOnEnterKeydown(evt) {
+  if (evt.keyCode === 13) {
+    term.attachCustomKeyEventHandler(null);
+    getTokens();
+    return false;
+  }
+}
+
+function resizeTerminal() {
+  if (Date.now() - rtime < delta) {
+    setTimeout(resizeTerminal, delta);
+  }
+  else {
+    timeout = false;
+    document.dispatchEvent(new CustomEvent('layoutUpdate'));
+  }
+}
+
+function isEditorOpen() {
+  return $("#terminal-open-editor").attr("editor-open") === "true";
+}
+
+document.addEventListener('layoutUpdate', function () {
+  if (isEditorOpen()) {
+    if (defaultHeight) {
+      $("#terminal-container").height($("#terminal-and-editor").height() * .2);
+      $("#editor-wrapper").height($("#terminal-and-editor").height() * .8);
+      $("#editor-bench").height($("#editor-wrapper").height() - 25);
+      $("#editor-dialog-back").height($("#editor-wrapper").height());
+    }
+    $("#editor-terminal-separator").attr("aria-valuenow", $("#terminal-container").height());
+    $("#editor-terminal-separator").attr("aria-valuemax", $("#terminal-and-editor").height() - $("#editor-terminal-separator").height());
+    $("#editor-terminal-separator").attr("aria-valuemin", 0);
+
+    $("#editor-explorer-separator").attr("aria-valuenow", $("#explorer-wrapper").width());
+    $("#editor-explorer-separator").attr("aria-valuemax", $("#editor-bench").width() - $("#editor-explorer-separator").width());
+    $("#editor-explorer-separator").attr("aria-valuemin", 0);
+  }
+  else {
+    $("#terminal-container").height($("#terminal-and-editor").height());
+  }
+  fitAddon.fit();
+});
+
+function waitingCursor(initialize, done) {
+  var printCursor = function () {
+    var index = 0;
+    var chars = ['-', '\\', '|', '/'];
+    return window.setInterval(function () {
+      term.write("\x1B[1D" + chars[index++ % chars.length]);
+    }, 200);
+  }();
+
+  initialize(function (timeout) {
+    window.setTimeout(
+      function () { window.clearInterval(printCursor); if (done) done(); },
+      timeout || 500);
+  });
+}
+
+function restartTerminal(msg) {
+  var initialization = function (setTimeout) {
+    var method = 'DELETE';
+    var targetUri = getConsoleUri();
+    var start = Date.now();
+
+    $.ajax(targetUri,
+      {
+        method: method,
+        contentType: 'application/json',
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        },
+        data: JSON.stringify({})
+      })
+      .fail(function (jqXHR, textStatus, errorThrown) {
+        logger.clientRequest('ACC.TERMINAL.RESTART', {}, Date.now() - start, method, targetUri, null, null, null, null, jqXHR.status);
+      })
+      .done(function (res, textStatus, jqXHR) {
+        setTimeout(10000);
+      });
+  };
+
+  restartTerminalInternal(msg, 'Restarting your Cloud Shell...', initialization);
+}
+
+function restartTerminalInternal(msg, consolemsg, initialize) {
+  term.attachCustomKeyEventHandler(null);
+  if (!accessToken) {
+    window.location.reload();
+  }
+
+  closeTerminal(true);
+
+  term.clear();
+
+  if (msg) {
+    term.writeln('\r' + msg + '\r\n');
+    fitAddon.fit();
+  }
+
+  term.write('\r' + consolemsg);
+
+  waitingCursor(
+    initialize,
+    function () {
+      window.location.reload();
+    });
+}
+
+
+
+function resetUserTerminal(msg) {
+  forceResetUserSettings(
+    function (jqXHR, textStatus, errorThrown, start, targetUri) {
+      $("#terminal-dialog-reset-user-failure").show();
+      $("#reset-user-failure-close").focus();
+
+      console.error('Error resetting user settings');
+    },
+    function (data, textStatus, jqXHR) {
+      $.ajax(getConsoleUri(),
+        {
+          method: "DELETE",
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Authorization': accessToken,
+            'x-ms-console-preferred-location': storage.location,
+            'Accept-Language': language
+          },
+          data: JSON.stringify({})
+        });
+      // reset ephemeralSession flag back to query parameter
+      ephemeralSession = getQueryParameter("feature.azureconsole.sessiontype") === 'ephemeral';
+      createTerminal();
+    }
+  );
+}
+
+
+function switchTerminal(msg) {
+  restartTerminalInternal(
+    msg,
+    'Switching your Cloud Shell...',
+    function (setTimeout) {
+      setTimeout(500);
+    }
+  );
+}
+
+function closeTerminal(disposeTerminal) {
+  if (term.connectTime) {
+    logger.clientTelemetry('ACC.TERMINAL.CLOSE', {}, {}, Date.now() - term.connectTime.getTime());
+  }
+
+  disableFileUploads();
+  disableEditorOpen();
+  termId = null;
+  userSettings = null;
+  storage = {};
+  term.connectionState = ConnectionState.NotConnected;
+  term.connectTime = null;
+  currentOpenPort = null;
+  addToLocalStorage('currentOpenPort', currentOpenPort);
+  if (disposeTerminal) {
+    term.dispose();
+  }
+}
+
+function handleSocketOpen() {
+  this.onerror = handleSocketError;
+  this.onclose = handleSocketClose;
+  attachAddon = new AttachAddon.AttachAddon(this);
+  term.loadAddon(attachAddon);
+  term.focus();
+  getTokenInterval = getTokenInterval || window.setInterval(getTokens, 1000 * 60 * 10);
+  term.connectionState = ConnectionState.Connected;
+  term.connectTime = new Date();
+  logger.clientTelemetry('ACC.TERMINAL.OPEN', {}, {}, Date.now() - term.connectTime.getTime());
+  backfillUserSettings();
+  enableFileUploads();
+  enableEditorOpen();
+  enableProxyOpen();
+  if (!ShellType.IsPowerShell(shellTypeSelection)) {
+    writeInjectedCommands();
+  }
+  activeSession = true;
+  if (cloudshellVersion >= "2018-03-01") {
+    postMessageHelper("connected");
+  }
+  socketMessages = 0;
+  keepSocketAlive(this);
+}
+
+var keepAliveID = 0;
+var pingCount = 0;
+var socketMessages = 0;
+const timeoutDuration = 1000;
+
+function keepSocketAlive(socket) {
+  if (socket.readyState == WebSocket.OPEN) {
+    if ((pingCount / 60) >= terminalIdleTimeout) {
+      socket.close();
+    }
+    else {
+      socket.send('');
+      pingCount++;
+      keepAliveID = setTimeout(function () { keepSocketAlive(socket) }, timeoutDuration);
+    }
+  }
+}
+
+function cancelSocketAlive() {
+  if (keepAliveID) {
+    clearTimeout(keepAliveID);
+    pingCount = 0;
+  }
+}
+
+function handleControlSocketOpen() {
+  this.onerror = handleSocketError;
+  this.onclose = handleControlSocketClose;
+}
+
+function handleControlSocketClose() {
+  if (term.connectionState === ConnectionState.Connected || term.connectionState === ConnectionState.Connecting) {
+    var that = this;
+    window.setTimeout(function () {
+      connectSocket(that.url, 0, that.onopen, that.onmessage, that.ontimeout);
+    }, 500);
+  }
+}
+
+function handleSocketClose() {
+  activeSession = false;
+  if (term.connectionState === ConnectionState.Connected) {
+    if (cloudshellVersion >= "2018-03-01") {
+      postMessageHelper("disconnected");
+    }
+    var socketOpenDuration = Date.now() - term.connectTime.getTime();
+    console.log("Socket closed after " + socketOpenDuration + " milliseconds, pingCount is at " + pingCount + ", terminalIdleTimeout is " + terminalIdleTimeout + ", socketMessages is " + socketMessages);
+    logger.clientTelemetry('ACC.TERMINAL.SOCKET.CLOSE', {}, { pingCount: pingCount, terminalIdleTimeout: terminalIdleTimeout, socketMessages: socketMessages }, Date.now() - term.connectTime.getTime());
+    closeTerminal(false);
+    cancelSocketAlive();
+    window.clearInterval(getTokenInterval);
+    getTokenInterval = null;
+    accessToken = null;
+    hideTerminal();
+    $(".terminal-dialog").hide();
+    $("#terminal-time-out-dialog").show();
+    $("#time-out-reconnect").focus();
+    $("#time-out-body").html(format($("#time-out-body").html(), terminalIdleTimeout));
+    if (userBrowserFirefox()) {
+      $("#time-out-body-firefox").html($("#time-out-body-firefox").text());
+    }
+    else {
+      $("#time-out-body-firefox").css('display', 'none');
+    }
+    $('#time-out-reconnect').off('keypress click keydown');
+    $('#time-out-quit').off('keypress click keydown');
+
+    enterClickHandler($("#time-out-reconnect"), function () {
+      $("#terminal-time-out-dialog").hide();
+      term.focus();
+      term.reset();
+      showTerminal();
+      getTokens();
+    });
+
+    arrowKeyHandler($("#time-out-reconnect"), "right", function () {
+      $("#time-out-quit").focus();
+    });
+
+    arrowKeyHandler($("time-out-quit"), "left", function () {
+      $("#time-out-reconnect").focus();
+    });
+
+    enterClickHandler($("#time-out-quit"), function () {
+      postMessageHelper("close");
+    });
+  }
+}
+
+function handleSocketError(event) {
+  console.error("Socket Error: " + JSON.stringify(event));
+}
+
+function handleSocketConnectionError(event) {
+  console.error("Socket Connection Error: " + JSON.stringify(event));
+
+  var that = this;
+
+  window.setTimeout(function () {
+    connectSocket(that.url, that.retryCount, that.onopen, that.onmessage, that.ontimeout);
+  }, 500);
+}
+
+function handleConnectionTimeout() {
+  closeTerminal(false);
+
+  accessToken = null;
+  term.writeln("\n\r\x1B[1;31mFailed to connect terminal: websocket cannot be established. Press \"Enter\" to reconnect.\x1B[0m ");
+  term.attachCustomKeyEventHandler(reconnectOnEnterKeydown);
+}
+
+function connectSocket(url, retryCount, handleSocketOpen, handleSocketMessage, handleConnectionTimeout) {
+  retryCount = retryCount || 0;
+
+  if (retryCount < 10) {
+    var socket = new WebSocket(url);
+    socket.retryCount = retryCount + 1;
+    socket.onopen = handleSocketOpen;
+    socket.onerror = handleSocketConnectionError;
+    socket.onmessage = handleSocketMessage;
+    socket.ontimeout = handleConnectionTimeout;
+  }
+  else {
+    handleConnectionTimeout();
+  }
+}
+
+function enterClickHandler(htmlElement, enterFunction) {
+  htmlElement.on('keypress click', function (e) {
+    if (e.which === 13 || e.type === 'click') {
+      enterFunction(e);
+    }
+  });
+}
+
+function arrowKeyHandler(htmlElement, direction, arrowKeyFunction) {
+  htmlElement.on('keypress keydown', function (e) {
+    if (e.which === 37 && direction === "left") {
+      arrowKeyFunction();
+    }
+
+    if (e.which === 38 && direction === "up") {
+      arrowKeyFunction();
+    }
+
+    if (e.which === 39 && direction === "right") {
+      arrowKeyFunction();
+    }
+
+    if (e.which === 40 && direction === "down") {
+      arrowKeyFunction();
+    }
+  });
+}
+
+function updateFontSize(size) {
+  if (!(size in fontSizes)) {
+    size = fontSizes.small;
+  }
+  if (currentFontSize !== size) {
+    var previousFontSize = currentFontSize;
+    currentFontSize = size;
+    $('.font-size-option').removeClass("selected-font-setting");
+    $("#font-size-option-" + size).addClass("selected-font-setting");
+    term.setOption('fontSize', fontSizes[size]);
+    if (previousFontSize != undefined) {
+      saveFontToUserSettings();
+    }
+    fitAddon.fit();
+    term.refresh(0, term.rows - 1);
+  }
+}
+
+function updateFontStyle(style) {
+  if (!(style in fontStyles)) {
+    style = fontStyles.monospace;
+  }
+  if (currentFontStyle !== style) {
+    var previousFontStyle = currentFontStyle;
+    currentFontStyle = style;
+    $('.font-style-option').removeClass("selected-font-setting");
+    $("#font-style-option-" + style).addClass("selected-font-setting");
+    term.setOption('fontFamily', fontStyles[style]);
+    if (previousFontStyle != undefined) {
+      saveFontToUserSettings();
+    }
+    fitAddon.fit();
+    term.refresh(0, term.rows - 1);
+  }
+}
+
+//TODO (rosturm): enable PATCH for font and perform PATCH insted of GET+POST
+function saveFontToUserSettings() {
+  var updateData;
+  loadUserSettings(
+    function (jqXHR, textStatus, errorThrown, start, targetUri) {
+      updateData = userSettings;
+      console.error('Error getting current user settings');
+    },
+    function (data, textStatus, jqXHR) {
+      updateData = data.properties;
+    },
+    function () {
+      updateData.terminalSettings = updateData.terminalSettings || {};
+      updateData.terminalSettings.fontSize = currentFontSize || "medium";
+      updateData.terminalSettings.fontStyle = currentFontStyle || "monospace";
+      var data = {
+        properties: updateData
+      };
+
+      putUserSettings(data,
+        function (jqXHR, textStatus, errorThrown) {
+          console.error('Error saving font selection to user settings: ' + errorThrown);
+        }, function (data, textStatus, jqXHR) { });
+    }
+  );
+}
+
+function closeProxyPort() {
+  var targetUri = consoleUri + '/ports/' + currentOpenPort + '/close';
+  $.ajax(targetUri,
+    {
+      method: "POST",
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language
+      },
+      data: JSON.stringify({})
+    })
+    .done(function (data, textStatus, jqXHR) {
+      currentOpenPort = null;
+      addToLocalStorage('currentOpenPort', currentOpenPort);
+    });
+}
+
+function openProxyPort(launch) {
+  var port = $("#proxy-configure-input-entry").val().trim();
+  var targetUri = consoleUri + '/ports/' + port + '/open';
+  var proxyUri = consoleUri + '/proxy/' + port + '/';
+  if (userBrowserEdge()) {
+    triggerLinkClick(proxyUri, "openProxy", true);
+  }
+  var proxyLaunchPage;
+  if (launch) {
+    if (userBrowserChrome() || userBrowserFirefox()) {
+      proxyLaunchPage = window.open('', "_blank");
+    }
+  }
+  var proxyUrl;
+  if (currentOpenPort && currentOpenPort !== "null" && currentOpenPort !== port) {
+    closeProxyPort();
+  }
+  $.ajax(targetUri,
+    {
+      method: "POST",
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Authorization': accessToken,
+        'Accept-Language': language
+      },
+      data: JSON.stringify({})
+    })
+    .fail(function (jqXHR, textStatus, errorThrown) {
+      if (launch) {
+        proxyLaunchPage.close();
+      }
+    })
+    .done(function (data, textStatus, jqXHR) {
+      proxyUrl = data.url;
+      currentOpenPort = port;
+      addToLocalStorage('currentOpenPort', currentOpenPort);
+      $("#proxy-configure-input-entry").val("");
+      $("#terminal-proxy-configure-dialog").hide();
+      $(".proxy-dropdown-element").show();
+      $(".current-active-port").text(currentOpenPort);
+      $("#preview-port-button").text(format($("#preview-port-button").attr('content'), port));
+      $("#close-port-button").text(format($("#close-port-button").attr('content'), port));
+      term.focus();
+      if (launch) {
+        if (userBrowserIE()) {
+          window.open(data.url, '_blank');
+        }
+        else if (!userBrowserEdge()) {
+          proxyLaunchPage.location.href = data.url;
+        }
+      }
+    });
+}
+
+function populateDirectoryInfo(claims) {
+  var unique_name = getUserNameFromClaims(claims);
+  $("#current-email").text(unique_name);
+  var tenantName = getQueryParameter("tenant") || claims.tid;
+  $("#current-tenant").text(tenantName);
+  $("#directory-name").text(tenantName);
+  var greeting = $("#directory-popout-greeting");
+  greeting.text(claims.given_name ? format(greeting.attr('greeting-text-name'), claims.given_name) : greeting.attr('greeting-text-noname'));
+}
+
+function getUserNameFromClaims(claims) {
+  var userName;
+  if (claims.upn && claims.upn.match(/\S/)) {
+    userName = claims.upn;
+  }
+  else {
+    userName = claims.unique_name;
+    if (userName && userName.indexOf('#') != -1 && userName.indexOf('#') != userName.length - 1) {
+      userName = userName.substring(userName.indexOf('#') + 1);
+    }
+  }
+  return userName;
+}
+
+// Generate a semi GUID.
+function guid() {
+  function s4() {
+    return Math.floor((1 + Math.random()) * 0x10000)
+      .toString(16)
+      .substring(1);
+  }
+
+  return s4() + s4() + '-' + s4() + '-' + s4() + '-' + s4() + '-' + s4() + s4() + s4();
+}
+
+function usingVnetOptions() {
+  return $('#vnet-settings-checkbox').is(':checked') && showAdvancedSettings;
+}
+
+function updateCreateButton() {
+  if (showAdvancedSettings) {
+    var hasRGInput = $("#use-existing-rg").prop("checked") || $("#resource-group-text-entry").val() !== "";
+    var hasSAInput = $("#use-existing-sa").prop("checked") || $("#storage-account-text-entry").val() !== "";
+    var hasFSInput = $("#file-share-entry").val() !== "";
+
+    if (usingVnetOptions()) {
+      var hasNPInput = $("#network-profile-select-entry").val();
+      var hasAGInput = $("#relay-namespace-select-entry").val();
+      var hasRGInput = $("#resource-group-select-entry").val();
+      var hasSAInput = $("#storage-account-select-entry").val();
+    }
+    if (hasRGInput && hasSAInput && hasFSInput && (usingVnetOptions() ? hasNPInput && hasAGInput : true)) {
+      $("#terminal-storage-creation-create").prop("disabled", false);
+    }
+    else {
+      $("#terminal-storage-creation-create").prop("disabled", true);
+    }
+  }
+  else {
+    $("#terminal-storage-creation-create").prop("disabled", false);
+  }
+}
+
+function updateTerminalBackgroundColor(state) {
+  if ($("#cloudshell-header").css("background-color") === "rgb(0, 0, 0)") {
+    backgroundColors["drag"] = "#ffffff";
+  }
+  term.setOption('theme', {
+    background: backgroundColors[state]
+  });
+}
+
+function setupFileDragDrop() {
+  var dragCount = 0;
+  $("#terminal-container").on("dragenter", function (e) {
+    dragCount++;
+    $("#terminal-container").addClass("dragging-file");
+    updateTerminalBackgroundColor("drag");
+  });
+
+  $("#terminal-container").on("dragleave", function (e) {
+    dragCount--;
+    if (dragCount === 0) {
+      $("#terminal-container").removeClass("dragging-file");
+      updateTerminalBackgroundColor(shellTypeSelection.toLowerCase());
+    }
+  });
+
+  $("#terminal-container").on("dragover", function (e) {
+    e.preventDefault();
+  });
+
+  $("#terminal-container").on("drop", function (e) {
+    dragCount = 0;
+    e.preventDefault();
+    $("#terminal-container").removeClass("dragging-file");
+    updateTerminalBackgroundColor(shellTypeSelection.toLowerCase());
+    var files = e.originalEvent.dataTransfer.files;
+    fileManager.startUpload(files, consoleUri + "/terminals/" + termId + "/upload");
+  });
+}
+
+function backfillUserSettings() {
+  var start = Date.now();
+  if (!userSettings.sessionType) {
+    userSettings.sessionType = SessionType.Mounted;
+  }
+  putUserSettings({ properties: userSettings }, function (jqXHR, textStatus, errorThrown) {
+    logger.clientRequest('ACC.BACKFILLSETTINGS.FAILURE', { "puid": puid }, Date.now() - start, 'PUT', "", null, null, null, null, jqXHR.status);
+  }, function (data, textStatus, jqXHR) {
+    logger.clientRequest('ACC.BACKFILLSETTINGS.SUCCEED', { "puid": puid }, Date.now() - start, 'PUT', "", null, null, null, null, jqXHR.status);
+  });
+}
+
+function enableFileUploads() {
+  setupFileDragDrop();
+  $("#terminal-file-selector").removeClass("disabled");
+  $("#terminal-file-selector").attr("tabindex", "0");
+  $("#terminal-file-selector").attr("aria-disabled", "false");
+  $("#terminal-file-selector").attr("role", "button");
+  enterClickHandler($("#terminal-file-selector"), function (e) {
+    if ($('#terminal-file-selector div.dropdown-content').css('display') === 'none') {
+      hideAllDropdowns();
+      $('#terminal-file-selector div.dropdown-content').css('display', 'inline-block');
+      $('#terminal-file-selector').attr('aria-expanded', "true");
+      $('#terminal-file-selector').focus();
+    }
+    else {
+      $('#terminal-file-selector div.dropdown-content').css('display', 'none');
+      $('#terminal-file-selector').attr('aria-expanded', "false");
+      $('#terminal-file-selector').focus();
+    }
+    stopClickEventPropagation(e);
+  });
+  enterClickHandler($("#terminal-upload"), function () {
+    $("#file-uploader").click();
+  });
+}
+
+function enableEditorOpen() {
+  $("#terminal-open-editor").removeClass("disabled");
+  $("#terminal-open-editor").attr("aria-disabled", "false");
+  enterClickHandler($('#terminal-open-editor'), function (e) {
+    if (!isEditorOpen()) {
+      defaultHeight = true;
+      document.dispatchEvent(new CustomEvent('show', {
+        detail: {
+          component: 'editor',
+          arguments: {
+            audience: 'editor',
+            folderUri: "/files" + userRootDirectory
+          }
+        }
+      }));
+    }
+    else {
+      $("#hide-editor").click();
+    }
+  });
+  $("#terminal-open-editor").attr("tabindex", "0");
+  $("#terminal-open-editor").attr("role", "button");
+}
+
+function setTextValues(ids) {
+  for (var i = 0; i < ids.length; i++) {
+    var element = $(ids[i]);
+    if (element.attr("title") === "") {
+      var label = element.attr("default-labels");
+      element.attr("title", label);
+      element.attr("aria-label", label);
+      if (element[0].hasAttribute("default-content")) {
+        var content = element.attr("default-content");
+        if (element[0].hasAttribute("content")) {
+          element.attr("content", content);
+        }
+        else {
+          element.text(content);
+        }
+      }
+    }
+  }
+}
+
+function writeInjectedCommands() {
+  if (injectedCommands === "") {
+    injectedCommands = getFromLocalStorage("injectedCommands") || "";
+  }
+  addToLocalStorage("injectedCommands", "");
+
+  // Extra steps if user is injecting commands into Powershell
+  //  1. Wait a few seconds for the directory to finish setting up
+  //  2. replace the \n with \r\n so new lines will be read as enter key presses
+  if (ShellType.IsPowerShell(shellTypeSelection)) {
+    attachAddon._socket.send(injectedCommands.replaceAll('\n', '\r\n'));;
+  }
+  else {
+    attachAddon._socket.send(injectedCommands);
+  }
+}
+
+function enableProxyOpen() {
+  $("#terminal-proxy-preview").attr("tabindex", "0");
+  $("#terminal-proxy-preview").attr("role", "button");
+  $("#terminal-proxy-preview").attr("aria-disabled", false);
+  $("#terminal-proxy-preview").removeClass("disabled");
+  setTextValues(["#terminal-proxy-preview", "#preview-port-button", "#close-port-button", "#configure-proxy-dropdown-element"]);
+  enterClickHandler($("#terminal-proxy-preview"), function (e) {
+    if ($('#terminal-proxy-preview div.dropdown-content').css('display') === 'none') {
+      hideAllDropdowns();
+      $('#terminal-proxy-preview div.dropdown-content').css('display', 'inline-block');
+      $('#terminal-proxy-preview').attr('aria-expanded', "true");
+      $('#terminal-proxy-preview').focus();
+    }
+    else {
+      $('#terminal-proxy-preview div.dropdown-content').css('display', 'none');
+      $('#terminal-proxy-preview').attr('aria-expanded', "false");
+      $('#terminal-proxy-preview').focus();
+    }
+    stopClickEventPropagation(e);
+  });
+  if (currentOpenPort && currentOpenPort !== "null") {
+    $(".proxy-dropdown-element").show();
+    $("#preview-port-button").text(format($("#preview-port-button").attr('content'), currentOpenPort));
+    $("#close-port-button").text(format($("#close-port-button").attr('content'), currentOpenPort));
+  }
+}
+
+function disableEditorOpen() {
+  $("#terminal-open-editor").addClass("disabled");
+  $("#terminal-open-editor").removeAttr("role");
+  $("#terminal-open-editor").removeAttr("tabindex");
+  $("#terminal-open-editor").attr("aria-disabled", "true");
+  $("#terminal-open-editor").off();
+}
+
+function disableFileUploads() {
+  $("#terminal-container").off("dragenter dragleave dragover drop");
+  $("#terminal-file-selector").addClass("disabled");
+  $("#terminal-file-selector").removeAttr("role");
+  $("#terminal-file-selector").removeAttr("tabindex");
+  $("#terminal-file-selector").attr("aria-disabled", "true");
+  $("#terminal-upload").off();
+  $("#terminal-file-selector").off();
+}
+
+function hideAllDropdowns() {
+  $('#terminal-header div.dropdown-content').css('display', 'none');
+  $('#terminal-header div.second-dropdown-content').css('display', 'none');
+  $('.terminal-button .terminal-header-button').attr('aria-expanded', "false");
+  $('.terminal-button').removeClass('active-selector');
+  $('#directory-popout').css('display', 'none');
+  $('#tenant-button').attr('aria-expanded', "false");
+}
+
+function stopClickEventPropagation(event) {
+  if (event.stopPropagation) {
+    event.stopPropagation();
+  }
+  else if (window.event) {
+    window.event.cancelBubble = true;
+  }
+};
+
+function validateAudience(audience) {
+  if (audience in tokenAudiences) {
+    return audience;
+  }
+  else if (audience + '/' in tokenAudiences) {
+    return audience + '/';
+  }
+  else if (audience.substr(-1) === '/') {
+    if (audience.substr(0, audience.length - 1) in tokenAudiences) {
+      return audience.substr(0, audience.length - 1);
+    }
+  }
+  return null;
+}
+
+function handleControlSocketJSON(msg) {
+  var audience = msg.audience;
+  if (audience === "download") {
+    var downloadUrl = consoleUri + msg.fileUri;
+    var id = downloadUrl.indexOf("downloads/") >= 0 ? downloadUrl.split("downloads/")[1] : "";
+    triggerLinkClick(downloadUrl, id, false);
+  }
+  if (audience === "editor") {
+    defaultHeight = true;
+    if (!msg.fileUri && !msg.folderUri) {
+      document.dispatchEvent(new CustomEvent('show', { detail: 'editor' }));
+      return;
+    }
+    if (msg.directory) {
+      codeEditorDirectory = msg.directory;
+    }
+    document.dispatchEvent(new CustomEvent('show', {
+      detail: {
+        component: 'editor',
+        arguments: msg
+      }
+    }));
+  }
+  if (audience === "token") {
+    var endpoint = validateAudience(msg.tokenAudience);
+    if (endpoint) {
+      logger.clientTelemetry('ACC.TOKEN.SEND', { "audience": endpoint, "puid": puid }, {}, 0);
+      postMessageHelper("getToken", { audience: tokenAudiences[endpoint] });
+    }
+    else {
+      logger.clientTelemetry('ACC.TOKEN.INVALID', { "audience": endpoint, "puid": puid }, {}, 0);
+      console.error("Audience '" + endpoint + "' cannot be handled.");
+    }
+  }
+  if (audience === "cert") {
+    try {
+      JSON.parse(msg.sshTokenData.jwk);
+    }
+    catch (error) {
+      msg.sshTokenData.jwk = reformatJwk(msg.sshTokenData.jwk); // fix the jwk formatting only if the json won't parse
+    }
+    postMessageHelper("getToken", { getTokenWithDetails: true, audience: "ssh1", sshTokenData: msg.sshTokenData });
+  }
+  if (audience === "url") {
+    var url = msg.url;
+    triggerLinkClick(url, "openLink", true);
+  }
+}
+
+function handleControlSocketMessage(e) {
+  var reader = new FileReader();
+  if (e.data instanceof Blob) {
+    reader.onload = function (event) {
+      handleControlSocketJSON(JSON.parse(reader.result));
+      return;
+    };
+    reader.readAsText(e.data);
+  }
+  else {
+    handleControlSocketJSON(JSON.parse(e.data));
+  }
+}
+
+function handleTerminalSocketMessage(e) {
+  pingCount = 0;
+  socketMessages++;
+  // Once first message is received on the websocket showing that Powershell is ready for input, check for commands to inject
+  if (ShellType.IsPowerShell(shellTypeSelection) && e.data.indexOf('PS /home') == 0 && getFromLocalStorage("injectedCommands").length > 0) {
+    writeInjectedCommands();
+  }
+}
+
+function triggerLinkClick(url, id, launchPage) {
+  var a = document.createElement("a");
+  a.href = url;
+  if (launchPage) {
+    a.target = "_blank";
+    $("#click-link-link").text($("#click-link-link").attr('open-link-text'));
+  }
+  else {
+    $("#click-link-link").text($("#click-link-link").attr('download-text'));
+  }
+  if (id) {
+    linksToOpen[id] = a;
+    $("#click-link-dialog").show();
+    $("#terminal-upload-status-dialog").hide();
+    $("#click-link-link").focus();
+  }
+}
+
+function resizeEditorAndTerminal(terminalContainerHeight) {
+  $("#terminal-container").height(terminalContainerHeight);
+  $("#editor-wrapper").height(terminalContainerHeight === maxHeight ? 0 : $("#terminal-and-editor").height() - terminalContainerHeight);
+  $("#editor-bench").height($("#editor-wrapper").height() - 25);
+  $("#editor-dialog-back").height($("#editor-wrapper").height());
+  $("#editor-terminal-separator").attr("aria-valuenow", $("#terminal-container").height());
+  rtime = Date.now();
+  if (timeout === false) {
+    timeout = true;
+    setTimeout(resizeTerminal, delta);
+  }
+}
+
+function resizeExplorerAndEditor(explorerWrapperWidth) {
+  var editorContainerWidth = $("#editor-wrapper").width() - explorerWrapperWidth;
+  $("#editor-container").css("flex", "initial");
+  $("#explorer-wrapper").width(explorerWrapperWidth);
+  $("#editor-container").width(editorContainerWidth);
+  document.dispatchEvent(new CustomEvent('layoutUpdate'));
+}
+
+function dragResizeHandler(e) {
+  defaultHeight = false;
+  e.preventDefault();
+  if (canResizeY) {
+    canResizeY = false;
+    window.requestAnimationFrame(function () {
+      var terminalContainerHeight = Math.min(terminalResizeOriginalHeight + startY - e.clientY, maxHeight);
+      resizeEditorAndTerminal(terminalContainerHeight);
+      canResizeY = true;
+    });
+  }
+  if (canResizeX) {
+    canResizeX = false;
+    window.requestAnimationFrame(function () {
+      var explorerWrapperWidth = Math.max(Math.min(e.clientX, maxWidth), 0);
+      resizeExplorerAndEditor(explorerWrapperWidth);
+      canResizeX = true;
+    });
+  }
+}
+
+function hideEditorMenu() {
+  $('#editor-titlebar-menu-dropdown').css('display', 'none');
+  $('#editor-titlebar-menu').attr('aria-expanded', "false");
+  $('#editor-titlebar-menu').focus();
+}
+
+var canResizeY = false;
+var canResizeX = false;
+var startY;
+var startX;
+var explorerResizeOriginalWidth;
+var terminalResizeOriginalHeight;
+var maxWidth = $("#terminal-and-editor").width() - $("#editor-explorer-separator").width();
+var maxHeight = $("#terminal-and-editor").height() - $("#editor-terminal-separator").height();
+
+$(document).ready(function () {
+  enterClickHandler($(".close-download-dialog"), function () {
+    $("#download-file-input-entry").val("");
+    $("#terminal-download-dialog").hide();
+    $("#terminal-file-selector").focus();
+  });
+
+  enterClickHandler($(".close-proxy-dialog"), function () {
+    $("#proxy-configure-input-entry").val("");
+    $("#terminal-proxy-configure-dialog").hide();
+    term.focus();
+  });
+
+  $("#terminal-container").height($("#terminal-and-editor").height());
+
+  $("#download-enter").on('click', function () {
+    var filename = $("#download-file-input-entry").val();
+    $("#download-file-input-entry").val("");
+    $("#download-file-input-entry").attr("aria-label", filename);
+    $("#download-enter").prop("disabled", true);
+    fileManager.startDownload(filename, consoleUri + "/terminals/" + termId + "/download");
+  });
+
+  $("#download-file-input-entry").on('keypress', function (e) {
+    if (e.which === 13) {
+      var filename = $("#download-file-input-entry").val();
+      $("#download-file-input-entry").val("");
+      $("#download-file-input-entry").attr("aria-label", filename);
+      $("#download-enter").prop("disabled", true);
+      fileManager.startDownload(filename, consoleUri + "/terminals/" + termId + "/download");
+    }
+  });
+
+  enterClickHandler($("#terminal-download"), function () {
+    $("#terminal-download-dialog").show();
+    $("#download-file-input-directory").text(userRootDirectory);
+    $("#download-file-input-directory").attr("aria-label", userRootDirectory)
+    $("#download-errors").hide();
+    $("#download-errors").attr("aria-label", $("#download-errors").val());
+    setTimeout(function () { $("#download-file-input-entry").focus(); }, 20);
+    $("#download-file-input-entry").on('input', function () {
+      if ($("#download-file-input-entry").val() !== "") {
+        $("#download-enter").prop("disabled", false);
+      }
+      else {
+        $("#download-enter").prop("disabled", true);
+      }
+    });
+  });
+
+  enterClickHandler($("#configure-proxy-dropdown-element"), function () {
+    const minimumPort = 1024;
+    const maximumPort = 49151;
+    const minimumReserved = 8080;
+    const maximumReserved = 8090;
+    const usedPorts = [50342];
+    $("#terminal-proxy-configure-dialog").show();
+    $(".proxy-configure-enter").prop("disabled", true);
+    setTimeout(function () { $("#proxy-configure-input-entry").focus(); }, 100);
+    $("#proxy-configure-input-entry").on('input', function () {
+      if ($("#proxy-configure-input-entry").val() !== "") {
+        var port = $("#proxy-configure-input-entry").val();
+        if (isNaN(port)) {
+          $("#port-errors").show();
+          $("#port-errors").text($("#port-errors").attr("port-invalid-error"));
+          $("#port-errors").attr("aria-label", "port-invalid-error");
+          $(".proxy-configure-enter").prop("disabled", true);
+        }
+        else {
+          port = Number(port);
+          if (port > minimumPort && port < maximumPort && (port < minimumReserved || port > maximumReserved) && usedPorts.indexOf(port) < 0) {
+            $(".proxy-configure-enter").prop("disabled", false);
+            $("#port-errors").hide();
+          }
+          else {
+            $("#port-errors").show();
+            $("#port-errors").text($("#port-errors").attr("port-unavailable-error"));
+            $("#port-errors").attr("aria-label", "port-invalid-error");
+            $(".proxy-configure-enter").prop("disabled", true);
+          }
+        }
+      }
+      else {
+        $(".proxy-configure-enter").prop("disabled", true);
+        $("#port-errors").hide();
+      }
+    });
+  });
+
+  $("#proxy-configure-open").click(function () {
+    openProxyPort(false);
+  });
+
+  $("#proxy-configure-open-browse").click(function () {
+    openProxyPort(true);
+  });
+
+  appInsights = window.appInsights || function (config) {
+    function i(config) { t[config] = function () { var i = arguments; t.queue.push(function () { t[config].apply(t, i) }) } } var t = { config: config }, u = document, e = window, o = "script", s = "AuthenticatedUserContext", h = "start", c = "stop", l = "Track", a = l + "Event", v = l + "Page", y = u.createElement(o), r, f; y.src = config.url || "https://az416426.vo.msecnd.net/scripts/a/ai.0.js"; u.getElementsByTagName(o)[0].parentNode.appendChild(y); try { t.cookie = u.cookie } catch (p) { } for (t.queue = [], t.version = "1.0", r = ["Event", "Exception", "Metric", "PageView", "Trace", "Dependency"]; r.length;)i("track" + r.pop()); return i("set" + s), i("clear" + s), i(h + a), i(c + a), i(h + v), i(c + v), i("flush"), config.disableExceptionTracking || (r = "onerror", i("_" + r), f = e[r], e[r] = function (config, i, u, e, o) { var s = f && f(config, i, u, e, o); return s !== !0 && t["_" + r](config, i, u, e, o), s }), t
+  }({
+    instrumentationKey: $("#app-insights-key").attr("value"),
+    endpointUrl: $("#app-insights-endpoint").attr("value"),
+    disableAjaxTracking: true
+  });
+
+  window.appInsights = appInsights;
+  appInsights.trackPageView();
+
+  logger = new Logger(getARMEndpoint(), appInsights);
+  fileManager = new FileManager();
+
+  if (embed) {
+    $('#terminal-header').hide();
+  }
+
+  $("#editor-terminal-separator").on("mousedown", function (e) {
+    startY = e.clientY;
+    maxHeight = $("#terminal-and-editor").height() - $("#editor-terminal-separator").height();
+    terminalResizeOriginalHeight = $("#terminal-container").height();
+    canResizeY = true;
+    $(document).on("mousemove", dragResizeHandler);
+    $(document).on("mouseup", function (e) {
+      canResizeY = false;
+      $(document).off("mousemove", dragResizeHandler);
+    });
+  });
+
+  $("#editor-explorer-separator").on("mousedown", function (e) {
+    maxWidth = $("#terminal-and-editor").width() - $("#editor-explorer-separator").width();
+    startX = e.clientX;
+    explorerResizeOriginalWidth = $("#explorer-wrapper").width();
+    canResizeX = true;
+    $(document).on("mousemove", dragResizeHandler);
+    $(document).on("mouseup", function (e) {
+      canResizeX = false;
+      $(document).off("mousemove", dragResizeHandler);
+    });
+  });
+
+  $("#editor-terminal-separator").on("keydown", function (e) {
+    var hasMoved = false;
+    maxHeight = $("#terminal-and-editor").height() - $("#editor-terminal-separator").height();
+    terminalResizeOriginalHeight = $("#terminal-container").height();
+    var terminalContainerHeight;
+    switch (e.keyCode) {
+      case 38: {
+        hasMoved = true;
+        terminalContainerHeight = Math.min(terminalResizeOriginalHeight + 10, maxHeight);
+        break;
+      }
+      case 40: {
+        hasMoved = true;
+        terminalContainerHeight = Math.max(terminalResizeOriginalHeight - 10, 0);
+        break;
+      }
+    }
+    if (hasMoved) {
+      defaultHeight = false;
+      e.stopPropagation();
+      resizeEditorAndTerminal(terminalContainerHeight);
+      rtime = Date.now();
+      if (timeout === false) {
+        timeout = true;
+        setTimeout(resizeTerminal, delta);
+      }
+    }
+  });
+
+  $("#editor-explorer-separator").on("keydown", function (e) {
+    maxWidth = $("#terminal-and-editor").width() - $("#editor-explorer-separator").width();
+    var hasMoved = false;
+    explorerResizeOriginalWidth = $("#explorer-wrapper").width();
+    var explorerWrapperWidth;
+    switch (e.keyCode) {
+      case 39: {
+        hasMoved = true;
+        explorerWrapperWidth = Math.min(explorerResizeOriginalWidth + 10, maxWidth);
+        break;
+      }
+      case 37: {
+        hasMoved = true;
+        explorerWrapperWidth = Math.max(explorerResizeOriginalWidth - 10, 0);
+        break;
+      }
+    }
+    if (hasMoved) {
+      defaultHeight = false;
+      e.stopPropagation();
+      resizeExplorerAndEditor(explorerWrapperWidth);
+    }
+  });
+
+  $(window).keydown(function (event) {
+    if (event.ctrlKey && event.keyCode == 192 && isEditorOpen()) {
+      // Let terminal and editor handle CTRL+`
+      event.preventDefault();
+    }
+  });
+
+  // On CTRL+ALT+R toggle screen reader mode
+  $(window).on("keydown", function (e) {
+    if ((e.ctrlKey || e.metaKey) && e.altKey && e.code == 'KeyR') {
+      screenReaderMode = screenReaderMode === "off" ? "on" : "off";
+      addToLocalStorage('screenReaderMode', screenReaderMode);
+      term.setOption('screenReaderMode', screenReaderMode === "on");
+      $("#terminal-container").attr('aria-label', $("#terminal-container").attr('screen-reader-' + screenReaderMode + '-message'));
+    }
+  });
+
+  if (popout) {
+    $("#terminal-minimize").hide();
+    $("#terminal-maximize").hide();
+    $("#terminal-close").hide();
+    $("#terminal-restore").hide();
+    $("#editor-titlebar-menu-dropdown").addClass("with-popout");
+  }
+
+  if (fullscreenDisplay) {
+    $("#terminal-maximize").hide();
+    $("#terminal-restore").show();
+  }
+
+  if (isUSGovCloud()) {
+    $("#terminal-popout").hide();
+    locationDisplayNames = locationDisplayNamesGov;
+    storageLocationMapping = storageLocationMappingGov;
+  }
+
+  $("#preview-label").hide();
+
+  if (isUSNatCloud()) {
+    $("#preview-label").show();
+    $("#terminal-popout").hide();
+    locationDisplayNames = locationDisplayNamesNat;
+    storageLocationMapping = storageLocationMappingNat;
+  }
+
+  if (isUSSecCloud()) {
+    $("#preview-label").show();
+    $("#terminal-popout").hide();
+    locationDisplayNames = locationDisplayNamesSec;
+    storageLocationMapping = storageLocationMappingSec;
+  }
+
+  if (isUX2Available()) {
+    $("#redirect-beta-element").show();
+  }
+
+  $("#click-link-link").on("click", function () {
+    for (var fileId in linksToOpen) {
+      window.open($(linksToOpen[fileId]).attr("href"), "_blank");
+    }
+    linksToOpen = {};
+
+    $("#click-link-dialog").hide();
+    term.focus();
+  });
+
+  enterClickHandler($("#click-link-dialog-close"), function () {
+    $("#click-link-dialog").hide();
+    term.focus();
+  });
+
+  $(".advanced-option-input").on('input', function () {
+    updateCreateButton();
+  });
+
+  $(".vnet-combobox").on('change', function () {
+    updateCreateButton();
+  });
+
+  $("#file-uploader").on('change', function () {
+    fileManager.startUpload($("#file-uploader")[0].files, consoleUri + "/terminals/" + termId + "/upload");
+    $("#file-uploader").val("");
+  });
+
+  $("#vnet-settings-checkbox").on('keypress', function (e) {
+    if (e.which === 13) {
+      $("#vnet-settings-checkbox").click();
+    }
+  });
+
+  enterClickHandler($("#terminal-close"), function () {
+    postMessageHelper("close");
+  });
+
+  enterClickHandler($("#directory-popout-signout"), function () {
+    postMessageHelper("close");
+  });
+
+  enterClickHandler($("#terminal-minimize"), function () {
+    postMessageHelper("minimize");
+  });
+
+  enterClickHandler($("#terminal-maximize"), function () {
+    $("#terminal-minimize").show();
+    $('#terminal-restore').show();
+    $("#terminal-maximize").hide();
+    postMessageHelper("maximize");
+  });
+
+  enterClickHandler($("#terminal-restore"), function () {
+    $("#terminal-minimize").show();
+    $("#terminal-restore").hide();
+    $('#terminal-maximize').show();
+    postMessageHelper("restore");
+  });
+
+  enterClickHandler($("#confirm-restart"), function () {
+    $("#terminal-restart-confirmation").hide();
+    showTerminal();
+    restartTerminal();
+  });
+
+  enterClickHandler($("#reset-user-failure-close"), function () {
+    postMessageHelper("close");
+  });
+
+  arrowKeyHandler($("#cancel-restart"), "left", function () {
+    $("#confirm-restart").focus();
+  });
+
+  arrowKeyHandler($("#confirm-restart"), "right", function () {
+    $("#cancel-restart").focus();
+  });
+
+  enterClickHandler($(".cancel-terminal-restart"), function () {
+    $("#terminal-restart-confirmation").hide();
+    $("#terminal-reset-user-settings-confirmation").hide();
+    $("#terminal-switch-shell-confirmation").hide();
+    showTerminal();
+    $("#terminal-shell-selector").focus();
+  });
+
+  enterClickHandler($("#confirm-reset-user-settings"), function () {
+    $("#terminal-reset-user-settings-confirmation").hide();
+    resetUserTerminal(); // Holder function to test visuals
+  });
+
+  arrowKeyHandler($("#cancel-reset-user-settings"), "left", function () {
+    $("#confirm-reset-user-settings").focus();
+  });
+
+  arrowKeyHandler($("#confirm-reset-user-settings"), "right", function () {
+    $("#cancel-reset-user-settings").focus();
+  });
+
+  enterClickHandler($(".cancel-terminal-reset"), function () {
+    $("#terminal-restart-confirmation").hide();
+    $("#terminal-reset-user-settings-confirmation").hide();
+    $("#terminal-switch-shell-confirmation").hide();
+    showTerminal();
+    $("#terminal-tool-selector").focus();
+  });
+
+  enterClickHandler($("#cancel-command-reload"), function () {
+    $("#command-reload-confirmation").hide();
+    $("#confirm-command-reload").off();
+    showTerminal();
+    term.focus();
+  });
+
+  enterClickHandler($("#upload-dialog-close"), function () {
+    $("#terminal-upload-status-dialog").stop();
+    $("#terminal-upload-status-dialog").hide();
+    $("#terminal-upload-status-dialog").css('opacity', '1');
+    term.focus();
+  });
+
+  $("#upload-dialog-close").focusin(function () {
+    $("#terminal-upload-status-dialog").stop();
+    $("#terminal-upload-status-dialog").css('opacity', '1');
+  });
+
+  $("#upload-dialog-close").focusout(function () {
+    hideUploadDialogue();
+  });
+
+  $("#terminal-upload-status-dialog").mouseenter(function () {
+    $("#terminal-upload-status-dialog").stop();
+    $("#terminal-upload-status-dialog").css('opacity', '1');
+  });
+
+  $("#terminal-upload-status-dialog").mouseleave(function () {
+    hideUploadDialogue();
+  });
+
+  function hideUploadDialogue() {
+    setTimeout(function () {
+      $("#terminal-upload-status-dialog").fadeOut(6000);
+    }, 10000);
+  }
+
+  enterClickHandler($("#cancel-switch-shell"), function () {
+    if (embed) {
+      postMessageHelper("close");
+    }
+  });
+
+  enterClickHandler($('#terminal-restart'), function (e) {
+    hideTerminal();
+    $("#terminal-storage-creation").hide();
+    $("#terminal-restart-confirmation").show();
+    $("#confirm-restart").focus();
+  });
+
+  enterClickHandler($('#terminal-reset-user-settings'), function (e) {
+    hideTerminal();
+    $("#terminal-storage-creation").hide();
+    $("#terminal-reset-user-settings-confirmation").show();
+    $("#confirm-reset-user-settings").focus();
+  });
+
+  enterClickHandler($('#terminal-popout'), function (e) {
+    var cloudShellLink = 'https://shell.azure.com/' + (tenantId ? '?tid=' + tenantId : '');
+    window.open(cloudShellLink, '_blank');
+  });
+
+  enterClickHandler($('#redirect-beta-element'), function (e) {
+    var betaLink = window.location.href.includes('v1') ? window.location.href.replace('v1', "v2") : window.location.href.replace(window.location.origin, window.location.origin + "/v2");
+    window.location.replace(betaLink);
+  });
+
+  enterClickHandler($('#preview-proxy-dropdown-element'), function (e) {
+    var proxyLink = consoleUri + '/proxy/' + currentOpenPort + '/';
+    window.open(proxyLink, '_blank');
+  });
+
+  enterClickHandler($('#close-proxy-dropdown-element'), function (e) {
+    closeProxyPort();
+    $(".proxy-dropdown-element").hide();
+  });
+
+  enterClickHandler($("#terminal-shell-selector"), function (e) {
+    if ($('#terminal-shell-selector div.dropdown-content').css('display') === 'none') {
+      hideAllDropdowns();
+      $('#terminal-shell-selector div.dropdown-content').css('display', 'inline-block');
+      $('#terminal-shell-selector').attr('aria-expanded', "true");
+      $('#terminal-shell-selector').focus();
+    }
+    else {
+      $('#terminal-shell-selector div.dropdown-content').css('display', 'none');
+      $('#terminal-shell-selector').attr('aria-expanded', "false");
+      $('#terminal-shell-selector').focus();
+    }
+    stopClickEventPropagation(e);
+  });
+
+  $('.terminal-button').on('focusin', function (e) {
+    $(this).addClass('active-selector');
+    var childrenVisible = $(this).children('div.dropdown-content').css('display');
+    if (childrenVisible === 'none' || childrenVisible === undefined) {
+      hideAllDropdowns();
+      $(this).attr('aria-expanded', "false");
+    }
+  });
+
+  $('.terminal-button').on('focusout', function () {
+    if (!($(this).attr('aria-expanded') === "true")) {
+      $(this).removeClass('active-selector');
+    }
+  });
+
+  $("#terminal-shell-selector").on('focusout mouseleave', function (e) {
+    if ($("#terminal-shell-selector").children('.dropdown-content').css('display') === "none" && !$(this).is(":focus")) {
+      $(this).removeClass('active-selector');
+      $(this).attr('aria-expanded', "false");
+    }
+  });
+
+  $("#terminal-help-selector").on('focusout mouseleave', function (e) {
+    if ($("#terminal-help-selector").children('.dropdown-content').css('display') === "none" && !$(this).is(":focus")) {
+      $(this).removeClass('active-selector');
+      $(this).attr('aria-expanded', "false");
+    }
+  });
+
+  $("#terminal-tool-selector").on('focusout mouseleave', function (e) {
+    if ($("#terminal-tool-selector").children('.dropdown-content').css('display') === "none" && !$(this).is(":focus")) {
+      $(this).removeClass('active-selector');
+      $(this).attr('aria-expanded', "false");
+    }
+  });
+
+  $("#terminal-file-selector").on('focusout mouseleave', function (e) {
+    if ($("#terminal-file-selector").children('.dropdown-content').css('display') === "none" && !$(this).is(":focus")) {
+      $(this).removeClass('active-selector');
+      $(this).attr('aria-expanded', "false");
+    }
+  });
+
+  enterClickHandler($("#terminal-help-selector"), function (e) {
+    if ($('#terminal-help-selector div.dropdown-content').css('display') === 'none') {
+      hideAllDropdowns();
+      $('#terminal-help-selector div.dropdown-content').css('display', 'inline-block');
+      $('#terminal-help-selector').attr('aria-expanded', "true");
+      $('#terminal-help-selector').focus();
+    }
+    else {
+      $('#terminal-help-selector div.dropdown-content').css('display', 'none');
+      $('#terminal-help-selector').attr('aria-expanded', "false");
+      $('#terminal-help-selector').focus();
+    }
+    stopClickEventPropagation(e);
+  });
+
+  enterClickHandler($("#terminal-tool-selector"), function (e) {
+    if ($('#terminal-tool-selector div.dropdown-content').css('display') === 'none') {
+      hideAllDropdowns();
+      $('#terminal-tool-selector div.dropdown-content').css('display', 'inline-block');
+      $('#terminal-tool-selector').attr('aria-expanded', "true");
+      $('#terminal-tool-selector').focus();
+    }
+    else {
+      $('#terminal-tool-selector div.dropdown-content').css('display', 'none');
+      $('#terminal-tool-selector').attr('aria-expanded', "false");
+      $('#terminal-tool-selector').focus();
+    }
+    stopClickEventPropagation(e);
+  });
+
+  enterClickHandler($("#tenant-button"), function (e) {
+    if ($('#directory-popout').css('display') === 'none') {
+      hideAllDropdowns();
+      $('#directory-popout').css('display', 'inline-block');
+      $('#tenant-button').attr('aria-expanded', "true");
+      $('#tenant-button').focus();
+    }
+    else {
+      $('#directory-popout').css('display', 'none');
+      $('#tenant-button').attr('aria-expanded', "false");
+      $('#tenant-button').focus();
+    }
+    stopClickEventPropagation(e);
+  });
+
+  enterClickHandler($("#editor-titlebar-menu"), function (e) {
+    if ($('#editor-titlebar-menu-dropdown').css('display') === 'none') {
+      hideAllDropdowns();
+      $('#editor-titlebar-menu-dropdown').css('display', 'inline-block');
+      $('#editor-titlebar-menu').attr('aria-expanded', "true");
+      $('#save-file-editor').focus();
+    }
+    else {
+      $('#editor-titlebar-menu-dropdown').css('display', 'none');
+      $('#editor-titlebar-menu').attr('aria-expanded', "false");
+      $('#editor-titlebar-menu').focus();
+    }
+    stopClickEventPropagation(e);
+  });
+
+  enterClickHandler($("#editor-wrapper"), function (e) {
+    if ($("#editor-titlebar-menu-dropdown").has($(e.target)).length == 0 && $('#editor-titlebar-menu-dropdown').css('display') !== "none") {
+      hideEditorMenu();
+    }
+  });
+
+  enterClickHandler($("#directory-popout"), function (e) {
+    stopClickEventPropagation(e);
+  });
+
+  $('.size-settings').on('focusin mouseenter click', function (e) {
+    $("#font-size-dropdown").css("left", $("#tools-dropdown").width());
+    $('#terminal-size-selector div.second-dropdown-content').css('display', 'inline-block');
+    $('#terminal-size-selector').attr('aria-expanded', "true");
+    $('#terminal-style-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-style-selector').attr('aria-expanded', "false");
+    stopClickEventPropagation(e);
+  });
+
+  $('.style-settings').on('focusin mouseenter click', function (e) {
+    $("#font-style-dropdown").css("left", $("#tools-dropdown").width());
+    $('#terminal-style-selector div.second-dropdown-content').css('display', 'inline-block');
+    $('#terminal-style-selector').attr('aria-expanded', "true");
+    $('#terminal-size-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-size-selector').attr('aria-expanded', "false");
+    stopClickEventPropagation(e);
+  });
+
+  $('#tools-feedback-element').on('focusin mouseenter click', function (e) {
+    $('#terminal-size-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-size-selector').attr('aria-expanded', "false");
+    $('#terminal-style-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-style-selector').attr('aria-expanded', "false");
+    stopClickEventPropagation(e);
+  });
+
+  $('#redirect-beta-element').on('focusin mouseenter click', function (e) {
+    $('#terminal-size-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-size-selector').attr('aria-expanded', "false");
+    $('#terminal-style-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-style-selector').attr('aria-expanded', "false");
+    stopClickEventPropagation(e);
+  });
+
+  $('#terminal-reset-user-settings').on('focusin mouseenter click', function (e) {
+    $('#terminal-size-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-size-selector').attr('aria-expanded', "false");
+    $('#terminal-style-selector div.second-dropdown-content').css('display', 'none');
+    $('#terminal-style-selector').attr('aria-expanded', "false");
+    stopClickEventPropagation(e);
+  });
+
+  $('#focusguard-restart-confirm-end').on('focus', function () {
+    $('#restart-close').focus();
+  });
+
+  $('#focusguard-restart-confirm-begin').on('focus', function () {
+    $('#cancel-restart').focus();
+  });
+
+  $('#focusguard-reset-confirm-end').on('focus', function () {
+    $('#reset-close').focus();
+  });
+
+  $('#focusguard-reset-confirm-begin').on('focus', function () {
+    $('#cancel-reset').focus();
+  });
+
+  $('#focusguard-download-dialog-end').on('focus', function () {
+    $('#download-close').focus();
+  });
+
+  $('#focusguard-download-dialog-begin').on('focus', function () {
+    $('#cancel-download').focus();
+  });
+
+  $('#focusguard-editor-save-end').on('focus', function () {
+    $('#editor-save-close').focus();
+  });
+
+  $('#focusguard-editor-save-begin').on('focus', function () {
+    $('#editor-save-cancel').focus();
+  });
+
+  $('#focusguard-switch-shell-end').on('focus', function () {
+    $('#switch-shell-close').focus();
+  });
+
+  $('#focusguard-switch-shell-begin').on('focus', function () {
+    $('#cancel-switch-shell').focus();
+  });
+
+  $('#focusguard-ostype-selection-end').on('focus', function () {
+    $('#terminal-ostype-close').focus();
+  });
+
+  $('#focusguard-ostype-selection-begin').on('focus', function () {
+    $('#os-ps-option').focus();
+  });
+
+  $('#focusguard-storage-creation-end').on('focus', function () {
+    $('#storage-creation-close').focus();
+  });
+
+  $('#focusguard-storage-creation-begin').on('focus', function () {
+    $('#terminal-storage-creation-close').focus();
+  });
+
+  $('#focusguard-time-out-end').on('focus', function () {
+    $('#time-out-reconnect').focus();
+  });
+
+  $('#focusguard-time-out-begin').on('focus', function () {
+    $('#time-out-quit').focus();
+  });
+
+  $('#focusguard-proxy-configure-end').on('focus', function () {
+    $('#proxy-configure-close').focus();
+  });
+
+  $('#focusguard-proxy-configure-begin').on('focus', function () {
+    $('#cancel-proxy-configure').focus();
+  });
+
+  enterClickHandler($("#invalid-subscription-quit"), function () {
+    postMessageHelper("close");
+  });
+
+  enterClickHandler($("#invalid-subscription-reconnect"), function () {
+    $("#terminal-invalid-subscription-dialog").hide();
+    var method = 'DELETE';
+    var targetUri = getARMEndpoint() + '/providers/Microsoft.Portal' + getAzureConsoleProviderLocation() + '/userSettings/cloudconsole?api-version=' + consoleApiVersion;
+    $.ajax(targetUri,
+      {
+        method: method,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'Authorization': accessToken,
+          'Accept-Language': language
+        },
+        data: JSON.stringify({})
+      })
+      .always(function () {
+        restartTerminal();
+      });
+  });
+
+
+  $(document).click(function () {
+    hideAllDropdowns();
+  });
+
+  $('.font-size-option').on('keypress click', function (e) {
+    if (e.which === 13 || e.type === 'click') {
+      var size = $(this).attr("value");
+      updateFontSize(size, this);
+      stopClickEventPropagation(e);
+      hideAllDropdowns();
+    }
+  });
+
+  $('.font-style-option').on('keypress click', function (e) {
+    if (e.which === 13 || e.type === 'click') {
+      var font = $(this).attr("value");
+      updateFontStyle(font, this);
+      stopClickEventPropagation(e);
+      hideAllDropdowns();
+    }
+  });
+
+  terminalContainer = document.getElementById('terminal-container');
+  if (window.parent !== window) {
+    setupParentMessage();
+  }
+  else {
+    $(terminalContainer).html("Sorry, something went wrong.");
+    $(terminalContainer).attr("aria-label", "Sorry, something went wrong.");
+  }
+});

@@ -1,0 +1,90 @@
+var allowedCommands = ["az", "kubectl", "echo", "set", "touch", "chmod", "Start-AzVM", "Get-AzVMExtension", "Get-AzVM", "wget", "mkdir", "mysql", "psql", "unzip", "go", "zip", "./aztfy", "helm", "clear", "git", "pip3", "python3", "kubelogin"];
+function handleCommandEvtBody(commands, logger) {
+    var fullCommand = "";
+    if (Array.isArray(commands)) {
+        commands.forEach(command => {
+            fullCommand = fullCommand + unpackCommand(command, logger);
+        });
+    }
+    else {
+        fullCommand = fullCommand + unpackCommand(commands, logger);
+    }
+
+    return fullCommand;
+}
+
+function unpackCommand(command, logger) {
+    var name = command.name;
+    if (!allowedCommands.includes(name)) {
+        if (logger) {
+            logger.clientTelemetry('ACC.COMMANDINJECTION.UNSUPPORTED', { "command": name }, {}, 0);
+        }
+        console.error(name + " is not supported in command injection");
+        return "";
+    }
+    if (logger) {
+        logger.clientTelemetry('ACC.COMMANDINJECTION', { "command": name }, {}, 0);
+    }
+    var args = command.args;
+    var output = name + " ";
+    var fullArgs = "";
+    if (Array.isArray(args)) {
+        args.forEach(arg => {
+            if (fullArgs.length > 0) {
+                fullArgs = fullArgs + " ";
+            }
+            fullArgs = fullArgs + unpackArgs(arg);
+        });
+    }
+    else {
+        fullArgs = unpackArgs(args);
+    }
+    return output + fullArgs + "\n";
+}
+
+function unpackArgs(arg) {
+    if(!arg) {
+        return "";
+    }
+    var prop = arg.prop;
+    var value = arg.value;
+    if (prop && value) {
+        return sanitizeArg(prop) + " " + sanitizeArg(value);
+    } else if(prop) {
+        return sanitizeArg(prop);
+    } else if(value) {
+        return sanitizeArg(value);
+    }
+    else {
+        return "";
+    }
+}
+
+function sanitizeArg(command) {
+    // strings that are empty or contain only safe characters (alphanumeric, hyphens, periods, backslashes and underscores) can be returned as is
+    if(command === '' || command.match("^[A-Za-z0-9._\\\\-]+$") || command.match("^>+$")) {
+        return command;
+    }
+    else {
+        // escape special characters with a preceding slash: & | ; $ > < \ ! ' " ( ) `
+        var escapedQuotes = command
+                                .replaceAll('&','\&')
+                                .replaceAll('|','\|')
+                                .replaceAll(';','\;')
+                                .replaceAll('$','\$')
+                                .replaceAll('>','\>')
+                                .replaceAll('<','\<')
+                                .replaceAll('\\','\\\\')
+                                .replaceAll('!','\!')
+                                .replaceAll("'","\'")
+                                .replaceAll('"','\"')
+                                .replaceAll('(','\(')
+                                .replaceAll(')','\)')
+                                .replaceAll('`', '\`')
+                                .trim();
+        return "\"" + escapedQuotes + "\"";
+    }
+    
+}
+
+module.exports = {sanitizeArg, unpackCommand, handleCommandEvtBody};

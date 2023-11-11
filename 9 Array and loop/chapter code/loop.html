@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+  <title>Loop</title>
+</head>
+<body>
+ <script>
+  // let num = 1; // intailisze
+  // while (num <= 49){
+  //   console.log(num);
+  //   num++;
+  // }
+      // let x = 0;
+      // while ( x < 1){
+      //   console.log(x);
+      //    x = Math.random() * 2;
+      // }
+      // console.log('final value is:' + x);
+      // let numb = [1,2,4,7,6,4,2,9,5,5,7,4,4,7,5,9,6];
+      // for ( let i = 0 ; i < numb.length - 1 ; i++){
+      //   console.log(numb[i]);
+      // }
+
+      //Accumalator Pattern
+       let nums = [1,5,7,8,4,5,6,7,8,9,7,2,4,1,1]
+       let sum = 0;
+       for ( let i = 0; i < nums.length; i++){
+        sum += nums[i];
+       }
+       console.log(`sum of the array : ${sum}`);
+
+       let squares = []
+       for ( let i = 0; i < nums.length; i++){
+        squares[i] = nums[i] * nums[i];
+       }
+       console.log(squares);
+
+     
+
+     
+ </script>
+</body>
+</html>

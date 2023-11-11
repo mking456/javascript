@@ -1,0 +1,14 @@
+body{
+  text-align: center;
+}
+.choice-button{
+  border-radius: 25px;
+  height: 100px;
+  width: 100px;
+  margin: 10px;
+  background-color: lavenderblush;
+  
+}
+.choice-image{
+  height: 75px;
+}

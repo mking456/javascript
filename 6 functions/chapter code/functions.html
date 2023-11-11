@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  
+  <title>Function</title>
+</head>
+<body>
+  <script>
+    // let age = 21;
+    // function printAge(){
+    //   console.log(`your age is ${age}`);
+    // }
+    //   printAge();
+    //   age = 23;
+    //   printAge();
+    //   age = 33;
+    //   printAge();
+
+  //   function generateRandomMove(){
+  //     let random = Math.random();
+  //     let randomMove = random * 3;
+  //     return random;
+  //   }
+  //   console.log(generateRandomMove());
+  //   console.log(generateRandomMove());
+  //   console.log(generateRandomMove());
+  //   console.log(generateRandomMove());
+  //   console.log(generateRandomMove());
+
+
+       function determineDriveStatus(){
+        let age = 18;
+        if (age === undefined){
+          return 'aap avatar hain';
+        }
+        console.log('Checking Driving Status...')
+        let status;
+        if (age >= 18){
+          status = 'You Can Drive';
+        }else 
+        status = 'Use A Bicycle';
+        return status;
+       }
+        console.log(determineDriveStatus());
+  // </script>
+</body>
+</html>
